@@ -42,6 +42,7 @@ static void LogMsg(const char* fmt, ...);
 static bool LooksLikeViewStrict(const D3DMATRIX& m);
 static bool LooksLikeProjectionStrict(const D3DMATRIX& m);
 float ExtractFOV(const D3DMATRIX& proj);
+class WrappedD3D9Device;
 
 #pragma comment(lib, "user32.lib")
 
@@ -96,9 +97,11 @@ static bool g_pauseToggleWasDown = false;
 static WNDPROC g_imguiPrevWndProc = nullptr;
 static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
-static bool g_showFpsStats = true;
+static bool g_showFpsStats = false;
 static bool g_showTransposedMatrices = false;
 static bool g_enableShaderEditing = false;
+static bool g_requestManualEmit = false;
+static char g_manualEmitStatus[192] = "";
 
 static constexpr int kMaxConstantRegisters = 256;
 static int g_selectedRegister = -1;
@@ -246,7 +249,23 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGui::StyleColorsDark();
+    ImGui::StyleColorsLight();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.90f, 0.90f, 0.90f, 0.94f);
+    style.Colors[ImGuiCol_ChildBg] = ImVec4(0.95f, 0.95f, 0.95f, 0.85f);
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.95f, 0.95f, 0.95f, 0.94f);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.82f, 0.82f, 0.82f, 0.70f);
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.74f, 0.74f, 0.74f, 0.80f);
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.68f, 0.68f, 0.68f, 0.90f);
+    style.Colors[ImGuiCol_Button] = ImVec4(0.75f, 0.75f, 0.75f, 0.80f);
+    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.66f, 0.66f, 0.66f, 0.90f);
+    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.58f, 0.58f, 0.58f, 1.00f);
+    style.Colors[ImGuiCol_Header] = ImVec4(0.72f, 0.72f, 0.72f, 0.65f);
+    style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.65f, 0.65f, 0.65f, 0.80f);
+    style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.58f, 0.58f, 0.58f, 0.90f);
+    style.Colors[ImGuiCol_Tab] = ImVec4(0.76f, 0.76f, 0.76f, 0.86f);
+    style.Colors[ImGuiCol_TabHovered] = ImVec4(0.66f, 0.66f, 0.66f, 0.95f);
+    style.Colors[ImGuiCol_TabActive] = ImVec4(0.70f, 0.70f, 0.70f, 0.95f);
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
@@ -975,33 +994,59 @@ static void RenderImGuiOverlay() {
 
     ImGui::SetNextWindowBgAlpha(0.7f);
     ImGui::SetNextWindowSize(ImVec2(640, 520), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Camera Matrices", nullptr,
+    ImGui::Begin("Camera Proxy for RTX Remix", nullptr,
                  ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoSavedSettings);
     ImGui::Text("Toggle menu: Alt+M | Pause rendering: Pause");
+    ImGui::TextWrapped("This proxy detects World, View, and Projection matrices from shader constants and forwards them "
+                       "to the RTX Remix runtime through SetTransform() so Remix gets camera data in D3D9 titles.");
+
+    if (ImGui::Button("Pass camera matrices to RTX Remix (SetTransform)")) {
+        if (!g_config.emitFixedFunctionTransforms) {
+            snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
+                     "Blocked: set EmitFixedFunctionTransforms=1 in camera_proxy.ini first.");
+        } else {
+            g_requestManualEmit = true;
+            snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
+                     "Pending: pass cached World/View/Projection matrices to RTX Remix this frame.");
+        }
+    }
+    if (g_manualEmitStatus[0] != '\0') {
+        ImGui::TextWrapped("%s", g_manualEmitStatus);
+    }
+
     ImGui::Checkbox("Show FPS stats", &g_showFpsStats);
     ImGui::Checkbox("Show transposed matrices", &g_showTransposedMatrices);
     if (g_showFpsStats && g_frameTimeSamples > 0) {
-        float minMs = g_frameTimeHistory[0];
-        float maxMs = g_frameTimeHistory[0];
         double sumMs = 0.0;
         for (int i = 0; i < g_frameTimeCount; i++) {
             float ms = g_frameTimeHistory[i];
-            if (ms < minMs) minMs = ms;
-            if (ms > maxMs) maxMs = ms;
             sumMs += ms;
         }
         float avgMs = g_frameTimeCount > 0 ? static_cast<float>(sumMs / g_frameTimeCount) : 0.0f;
         float avgFps = avgMs > 0.0f ? 1000.0f / avgMs : 0.0f;
-        float minFps = maxMs > 0.0f ? 1000.0f / maxMs : 0.0f;
-        float maxFps = minMs > 0.0f ? 1000.0f / minMs : 0.0f;
-        ImGui::Text("FPS avg/min/max: %.1f / %.1f / %.1f", avgFps, minFps, maxFps);
-        ImGui::Text("Frame time ms avg/min/max: %.2f / %.2f / %.2f",
-                    avgMs, minMs, maxMs);
+        float graphMaxMs = (std::max)(33.0f, avgMs * 1.75f);
+        ImGui::Text("FPS: %.1f", avgFps);
+        ImGui::Text("ms: %.2f", avgMs);
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.10f, 0.70f, 0.20f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_PlotLinesHovered, ImVec4(0.35f, 0.95f, 0.40f, 1.00f));
         ImGui::PlotLines("Frame time (ms)", g_frameTimeHistory, g_frameTimeCount, g_frameTimeIndex,
-                         nullptr, 0.0f, maxMs > 0.0f ? maxMs : 33.0f,
+                         nullptr, 0.0f, graphMaxMs,
                          ImVec2(0, 80));
+        ImGui::PopStyleColor(2);
     }
+
+    ImGui::Separator();
+    ImGui::Text("Credits: ");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.15f, 0.65f, 0.15f, 1.0f), "Overseer");
+    ImGui::SameLine();
+    ImGui::Text("- https://github.com/mencelot/dmc4-camera-proxy");
+    ImGui::TextColored(ImVec4(0.15f, 0.65f, 0.15f, 1.0f), "modified by cobalticarus92");
+    ImVec2 min = ImGui::GetItemRectMin();
+    ImVec2 max = ImGui::GetItemRectMax();
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(min.x, max.y), ImVec2(max.x, max.y),
+                                        ImGui::GetColorU32(ImVec4(0.15f, 0.65f, 0.15f, 1.0f)), 1.0f);
 
     ImGui::Separator();
     if (ImGui::BeginTabBar("MainTabs")) {
@@ -1910,6 +1955,12 @@ public:
         UpdateImGuiToggle();
         UpdatePauseToggle();
         RenderImGuiOverlay();
+        if (g_requestManualEmit) {
+            EmitFixedFunctionTransforms();
+            g_requestManualEmit = false;
+            snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
+                     "Sent cached World/View/Projection matrices to RTX Remix via SetTransform().");
+        }
 
         if (g_pauseRendering) {
             Sleep(1);
