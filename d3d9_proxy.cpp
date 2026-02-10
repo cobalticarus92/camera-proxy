@@ -803,40 +803,52 @@ static bool TryBuildMatrixFromConstantUpdate(const float* constantData,
     return true;
 }
 
-static bool TryBuildMatrixFromSnapshot(const ShaderConstantState& state, int baseRegister,
-                                       D3DMATRIX* outMatrix) {
-    if (!state.snapshotReady || baseRegister < 0 ||
-        baseRegister + 3 >= kMaxConstantRegisters) {
+static bool TryBuildMatrixSnapshot(const ShaderConstantState& state,
+                                  int baseRegister,
+                                  int rows,
+                                  bool transposed,
+                                  D3DMATRIX* outMatrix) {
+    if (!outMatrix || !state.snapshotReady || baseRegister < 0 || rows < 3 || rows > 4 ||
+        baseRegister + rows - 1 >= kMaxConstantRegisters) {
         return false;
     }
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < rows; i++) {
         if (!state.valid[baseRegister + i]) {
             return false;
         }
     }
 
-    memset(outMatrix, 0, sizeof(D3DMATRIX));
-    outMatrix->_11 = state.constants[baseRegister + 0][0];
-    outMatrix->_12 = state.constants[baseRegister + 0][1];
-    outMatrix->_13 = state.constants[baseRegister + 0][2];
-    outMatrix->_14 = state.constants[baseRegister + 0][3];
+    const float* m = &state.constants[baseRegister][0];
+    D3DMATRIX out = {};
 
-    outMatrix->_21 = state.constants[baseRegister + 1][0];
-    outMatrix->_22 = state.constants[baseRegister + 1][1];
-    outMatrix->_23 = state.constants[baseRegister + 1][2];
-    outMatrix->_24 = state.constants[baseRegister + 1][3];
+    if (!transposed) {
+        out._11 = m[0]; out._12 = m[1]; out._13 = m[2]; out._14 = m[3];
+        out._21 = m[4]; out._22 = m[5]; out._23 = m[6]; out._24 = m[7];
+        out._31 = m[8]; out._32 = m[9]; out._33 = m[10]; out._34 = m[11];
+        if (rows == 4) {
+            out._41 = m[12]; out._42 = m[13]; out._43 = m[14]; out._44 = m[15];
+        } else {
+            out._41 = 0.0f; out._42 = 0.0f; out._43 = 0.0f; out._44 = 1.0f;
+        }
+    } else {
+        out._11 = m[0]; out._21 = m[1]; out._31 = m[2]; out._41 = m[3];
+        out._12 = m[4]; out._22 = m[5]; out._32 = m[6]; out._42 = m[7];
+        out._13 = m[8]; out._23 = m[9]; out._33 = m[10]; out._43 = m[11];
+        if (rows == 4) {
+            out._14 = m[12]; out._24 = m[13]; out._34 = m[14]; out._44 = m[15];
+        } else {
+            out._14 = 0.0f; out._24 = 0.0f; out._34 = 0.0f; out._44 = 1.0f;
+        }
+    }
 
-    outMatrix->_31 = state.constants[baseRegister + 2][0];
-    outMatrix->_32 = state.constants[baseRegister + 2][1];
-    outMatrix->_33 = state.constants[baseRegister + 2][2];
-    outMatrix->_34 = state.constants[baseRegister + 2][3];
-
-    outMatrix->_41 = state.constants[baseRegister + 3][0];
-    outMatrix->_42 = state.constants[baseRegister + 3][1];
-    outMatrix->_43 = state.constants[baseRegister + 3][2];
-    outMatrix->_44 = state.constants[baseRegister + 3][3];
+    *outMatrix = out;
     return true;
+}
+
+static bool TryBuildMatrixFromSnapshot(const ShaderConstantState& state, int baseRegister,
+                                       D3DMATRIX* outMatrix) {
+    return TryBuildMatrixSnapshot(state, baseRegister, 4, false, outMatrix);
 }
 
 static bool TryBuildMatrixSnapshotInfo(const ShaderConstantState& state, int baseRegister,
