@@ -66,5 +66,5 @@ Heuristic profiles can be saved per shader (hashed by shader bytecode) and persi
 - For manual analysis, set `LogAllConstants=1` and inspect the log to find which registers contain camera data
 
 # Credits
-Mencelot
-Kim2091
+- Mencelot
+- Kim2091
