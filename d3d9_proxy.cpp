@@ -97,6 +97,7 @@ static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
 static bool g_showFpsStats = true;
 static bool g_showTransposedMatrices = false;
+static bool g_enableShaderEditing = false;
 
 static constexpr int kMaxConstantRegisters = 256;
 static int g_selectedRegister = -1;
@@ -106,6 +107,8 @@ static uintptr_t g_selectedShaderKey = 0;
 struct ShaderConstantState {
     float constants[kMaxConstantRegisters][4] = {};
     bool valid[kMaxConstantRegisters] = {};
+    float overrideConstants[kMaxConstantRegisters][4] = {};
+    bool overrideValid[kMaxConstantRegisters] = {};
     bool snapshotReady = false;
     unsigned long long sampleCount = 0;
     double mean[kMaxConstantRegisters][4] = {};
@@ -293,6 +296,63 @@ static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMis
     g_shaderOrder.push_back(shaderKey);
     auto inserted = g_shaderConstants.emplace(shaderKey, ShaderConstantState{});
     return &inserted.first->second;
+}
+
+static void ClearAllShaderOverrides() {
+    for (auto& entry : g_shaderConstants) {
+        ShaderConstantState& state = entry.second;
+        memset(state.overrideConstants, 0, sizeof(state.overrideConstants));
+        memset(state.overrideValid, 0, sizeof(state.overrideValid));
+    }
+}
+
+static void ClearShaderRegisterOverride(uintptr_t shaderKey, int reg) {
+    if (reg < 0 || reg >= kMaxConstantRegisters) {
+        return;
+    }
+    ShaderConstantState* state = GetShaderState(shaderKey, false);
+    if (!state) {
+        return;
+    }
+    memset(state->overrideConstants[reg], 0, sizeof(state->overrideConstants[reg]));
+    state->overrideValid[reg] = false;
+}
+
+static bool BuildOverriddenConstants(const ShaderConstantState& state,
+                                     UINT startRegister,
+                                     UINT vector4fCount,
+                                     const float* sourceData,
+                                     std::vector<float>& scratch) {
+    if (!g_enableShaderEditing || !sourceData || vector4fCount == 0) {
+        return false;
+    }
+
+    bool hasOverride = false;
+    for (UINT i = 0; i < vector4fCount; i++) {
+        UINT reg = startRegister + i;
+        if (reg >= kMaxConstantRegisters) {
+            break;
+        }
+        if (state.overrideValid[reg]) {
+            hasOverride = true;
+            break;
+        }
+    }
+    if (!hasOverride) {
+        return false;
+    }
+
+    scratch.assign(sourceData, sourceData + vector4fCount * 4);
+    for (UINT i = 0; i < vector4fCount; i++) {
+        UINT reg = startRegister + i;
+        if (reg >= kMaxConstantRegisters) {
+            break;
+        }
+        if (state.overrideValid[reg]) {
+            memcpy(&scratch[i * 4], state.overrideConstants[reg], sizeof(state.overrideConstants[reg]));
+        }
+    }
+    return true;
 }
 
 static void UpdateVariance(ShaderConstantState& state, int reg, const float* values) {
@@ -708,10 +768,41 @@ static void RenderImGuiOverlay() {
         ImGui::Checkbox("Group by 4-register matrices", &g_showConstantsAsMatrices);
         ImGui::SameLine();
         ImGui::Checkbox("Only show detected matrices", &g_filterDetectedMatrices);
+
+        ImGui::Separator();
+        ImGui::Checkbox("Enable shader constant editing", &g_enableShaderEditing);
+        ImGui::SameLine();
+        if (ImGui::Button("Reset all overrides")) {
+            ClearAllShaderOverrides();
+        }
+
+        ShaderConstantState* editState = GetShaderState(g_selectedShaderKey, false);
         if (g_selectedRegister >= 0) {
             ImGui::Text("Selected register: c%d", g_selectedRegister);
+            if (editState && g_selectedRegister < kMaxConstantRegisters) {
+                float editValues[4] = {};
+                if (editState->overrideValid[g_selectedRegister]) {
+                    memcpy(editValues, editState->overrideConstants[g_selectedRegister], sizeof(editValues));
+                } else if (editState->valid[g_selectedRegister]) {
+                    memcpy(editValues, editState->constants[g_selectedRegister], sizeof(editValues));
+                }
+
+                if (ImGui::InputFloat4("Override values", editValues, "%.6f")) {
+                    memcpy(editState->overrideConstants[g_selectedRegister], editValues,
+                           sizeof(editState->overrideConstants[g_selectedRegister]));
+                    editState->overrideValid[g_selectedRegister] = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset selected override")) {
+                    ClearShaderRegisterOverride(g_selectedShaderKey, g_selectedRegister);
+                }
+                if (!g_enableShaderEditing) {
+                    ImGui::TextDisabled("Editing is armed but inactive until enabled.");
+                }
+            }
         }
-        ImGui::BeginChild("ConstantsScroll", ImVec2(0, 340), true);
+
+        ImGui::BeginChild("ConstantsScroll", ImVec2(0, 300), true);
         ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
         if (state && state->snapshotReady) {
             if (g_showConstantsAsMatrices) {
@@ -1109,14 +1200,21 @@ public:
     {
         uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
         ShaderConstantState* state = GetShaderState(shaderKey, true);
+
+        std::vector<float> overrideScratch;
+        const float* effectiveConstantData = pConstantData;
+        if (BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
+            effectiveConstantData = overrideScratch.data();
+        }
+
         for (UINT i = 0; i < Vector4fCount; i++) {
             UINT reg = StartRegister + i;
             if (reg >= kMaxConstantRegisters) {
                 break;
             }
-            memcpy(state->constants[reg], pConstantData + i * 4, sizeof(state->constants[reg]));
+            memcpy(state->constants[reg], effectiveConstantData + i * 4, sizeof(state->constants[reg]));
             state->valid[reg] = true;
-            UpdateVariance(*state, static_cast<int>(reg), pConstantData + i * 4);
+            UpdateVariance(*state, static_cast<int>(reg), effectiveConstantData + i * 4);
         }
         state->snapshotReady = true;
 
@@ -1130,8 +1228,8 @@ public:
                 for (UINT i = 0; i < Vector4fCount && i < 4; i++) {
                     LogMsg("  c%d: [%.3f, %.3f, %.3f, %.3f]",
                            StartRegister + i,
-                           pConstantData[i*4+0], pConstantData[i*4+1],
-                           pConstantData[i*4+2], pConstantData[i*4+3]);
+                           effectiveConstantData[i*4+0], effectiveConstantData[i*4+1],
+                           effectiveConstantData[i*4+2], effectiveConstantData[i*4+3]);
                 }
             }
         }
@@ -1140,7 +1238,7 @@ public:
         // Extract what we can and synthesize valid View/Projection data
         if (StartRegister == 0 && Vector4fCount >= 4) {
             D3DMATRIX mvp;
-            memcpy(&mvp, pConstantData, sizeof(D3DMATRIX));
+            memcpy(&mvp, effectiveConstantData, sizeof(D3DMATRIX));
             StoreMVPMatrix(mvp);
 
             bool allowMvpExtraction = g_config.autoDetectMatrices ||
@@ -1151,7 +1249,7 @@ public:
                 // Check for valid floats (skip LooksLikeMatrix - MVP has large values)
                 bool validFloats = true;
                 for (int i = 0; i < 16 && validFloats; i++) {
-                    if (!std::isfinite(pConstantData[i])) validFloats = false;
+                    if (!std::isfinite(effectiveConstantData[i])) validFloats = false;
                 }
 
                 if (validFloats) {
@@ -1181,7 +1279,7 @@ public:
         // Auto-detect mode - scan for matrices (fallback)
         if (g_config.autoDetectMatrices && Vector4fCount >= 4 && StartRegister != 0) {
             for (UINT offset = 0; offset + 4 <= Vector4fCount; offset++) {
-                const float* matData = pConstantData + offset * 4;
+                const float* matData = effectiveConstantData + offset * 4;
                 if (LooksLikeMatrix(matData)) {
                     D3DMATRIX mat;
                     memcpy(&mat, matData, sizeof(D3DMATRIX));
@@ -1217,7 +1315,7 @@ public:
             StartRegister + Vector4fCount >= (UINT)g_config.viewMatrixRegister + 4)
         {
             int offset = (g_config.viewMatrixRegister - StartRegister) * 4;
-            const float* matrixData = pConstantData + offset;
+            const float* matrixData = effectiveConstantData + offset;
 
             if (LooksLikeMatrix(matrixData)) {
                 D3DMATRIX mat;
@@ -1241,7 +1339,7 @@ public:
             StartRegister + Vector4fCount >= (UINT)g_config.projMatrixRegister + 4)
         {
             int offset = (g_config.projMatrixRegister - StartRegister) * 4;
-            const float* matrixData = pConstantData + offset;
+            const float* matrixData = effectiveConstantData + offset;
 
             if (LooksLikeMatrix(matrixData)) {
                 D3DMATRIX mat;
@@ -1268,7 +1366,7 @@ public:
             StartRegister + Vector4fCount >= (UINT)g_config.worldMatrixRegister + 4)
         {
             int offset = (g_config.worldMatrixRegister - StartRegister) * 4;
-            const float* matrixData = pConstantData + offset;
+            const float* matrixData = effectiveConstantData + offset;
 
             if (LooksLikeMatrix(matrixData)) {
                 D3DMATRIX mat;
@@ -1288,7 +1386,7 @@ public:
             }
         }
 
-        return m_real->SetVertexShaderConstantF(StartRegister, pConstantData, Vector4fCount);
+        return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
     }
 
     // Present - good place to do per-frame logging throttle

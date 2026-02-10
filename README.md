@@ -46,6 +46,8 @@ Edit `camera_proxy.ini` to adjust behavior:
 | `AutoDetectMatrices` | 0 | Scan all constants for view/projection matrices |
 | `LogAllConstants` | 0 | Log all shader constant updates (very verbose) |
 
+You can also open the in-game constants view and enable **shader constant editing** to override individual `c#` registers live; overrides are injected into the final `SetVertexShaderConstantF` call (so changes affect rendering) and can be reset per-register or globally from the UI.
+
 ## Troubleshooting
 
 - Check `camera_proxy.log` in the game folder for diagnostic output
