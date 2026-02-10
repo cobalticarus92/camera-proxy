@@ -58,6 +58,8 @@ The ImGui overlay is now organized into tabs for **Camera**, **Constants**, **He
 
 Heuristic profiles can be saved per shader (hashed by shader bytecode) and persisted in `camera_proxy_profiles.ini` to avoid repeating setup across runs.
 
+You can also open the in-game constants view and enable **shader constant editing** to override individual `c#` registers live; overrides are injected into the final `SetVertexShaderConstantF` call (so changes affect rendering) and can be reset per-register or globally from the UI.
+
 ## Troubleshooting
 
 - Check `camera_proxy.log` in the game folder for diagnostic output
