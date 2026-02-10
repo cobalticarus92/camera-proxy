@@ -1202,20 +1202,22 @@ static void RenderImGuiOverlay() {
                                     if (g_showTransposedMatrices && hasMatrix) {
                                         int row = reg - base;
                                         const float* data = reinterpret_cast<const float*>(&displayMat) + row * 4;
-                                        snprintf(rowLabel, sizeof(rowLabel), "r%d: [%.3f %.3f %.3f %.3f]",
-                                                 row, data[0], data[1], data[2], data[3]);
+                                        snprintf(rowLabel, sizeof(rowLabel), "r%d: [%.3f %.3f %.3f %.3f]###reg_%d",
+                                                 row, data[0], data[1], data[2], data[3], reg);
                                     } else {
                                         const float* data = state->constants[reg];
-                                        snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
-                                                 reg, data[0], data[1], data[2], data[3]);
+                                        snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]###reg_%d",
+                                                 reg, data[0], data[1], data[2], data[3], reg);
                                     }
                                 } else {
-                                    snprintf(rowLabel, sizeof(rowLabel), "c%d: <unset>", reg);
+                                    snprintf(rowLabel, sizeof(rowLabel), "c%d: <unset>###reg_%d", reg, reg);
                                 }
                                 bool selected = (g_selectedRegister == reg);
+                                ImGui::PushID(reg);
                                 if (ImGui::Selectable(rowLabel, selected)) {
                                     g_selectedRegister = reg;
                                 }
+                                ImGui::PopID();
                             }
                             ImGui::TreePop();
                         }
@@ -1227,11 +1229,13 @@ static void RenderImGuiOverlay() {
                         }
                         const float* data = state->constants[reg];
                         char rowLabel[128];
-                        snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
-                                 reg, data[0], data[1], data[2], data[3]);
+                        snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]###reg_%d",
+                                 reg, data[0], data[1], data[2], data[3], reg);
+                        ImGui::PushID(reg);
                         if (ImGui::Selectable(rowLabel, g_selectedRegister == reg)) {
                             g_selectedRegister = reg;
                         }
+                        ImGui::PopID();
                     }
                 }
             } else {
