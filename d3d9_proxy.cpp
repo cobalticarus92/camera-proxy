@@ -195,10 +195,13 @@ struct ShaderConstantState {
     int stableViewCount = 0;
     int stableProjBase = -1;
     int stableProjCount = 0;
+    unsigned long long lastChangeSerial = 0;
 };
 
 static std::unordered_map<uintptr_t, ShaderConstantState> g_shaderConstants = {};
 static std::vector<uintptr_t> g_shaderOrder = {};
+static std::unordered_map<uintptr_t, bool> g_disabledShaderZeroing = {};
+static unsigned long long g_constantChangeSerial = 0;
 static HANDLE g_memoryScannerThread = nullptr;
 static DWORD g_memoryScannerThreadId = 0;
 static DWORD g_memoryScannerLastTick = 0;
@@ -216,9 +219,12 @@ static LARGE_INTEGER g_prevCounter = {};
 static bool g_perfInitialized = false;
 
 static std::deque<std::string> g_logLines = {};
+static std::vector<std::string> g_logSnapshot = {};
 static std::vector<std::string> g_memoryScanResults = {};
 static std::mutex g_uiDataMutex;
 static constexpr size_t kMaxUiLogLines = 600;
+static bool g_logsLiveUpdate = false;
+static bool g_logSnapshotDirty = true;
 
 
 static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -316,27 +322,31 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    // Keep default-dark readability, but mute the saturated blue accents into gray.
-    style.Colors[ImGuiCol_CheckMark] = ImVec4(0.70f, 0.70f, 0.70f, 1.00f);
-    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.58f, 0.58f, 0.58f, 1.00f);
-    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.72f, 0.72f, 0.72f, 1.00f);
-    style.Colors[ImGuiCol_Button] = ImVec4(0.28f, 0.28f, 0.28f, 0.60f);
-    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.38f, 0.38f, 0.38f, 1.00f);
-    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.47f, 0.47f, 0.47f, 1.00f);
-    style.Colors[ImGuiCol_Header] = ImVec4(0.33f, 0.33f, 0.33f, 0.50f);
-    style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.42f, 0.42f, 0.42f, 0.80f);
-    style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.48f, 0.48f, 0.48f, 0.85f);
-    style.Colors[ImGuiCol_Separator] = ImVec4(0.43f, 0.43f, 0.43f, 0.50f);
-    style.Colors[ImGuiCol_SeparatorHovered] = ImVec4(0.55f, 0.55f, 0.55f, 0.78f);
-    style.Colors[ImGuiCol_SeparatorActive] = ImVec4(0.65f, 0.65f, 0.65f, 1.00f);
-    style.Colors[ImGuiCol_ResizeGrip] = ImVec4(0.62f, 0.62f, 0.62f, 0.25f);
-    style.Colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.74f, 0.74f, 0.74f, 0.67f);
-    style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(0.84f, 0.84f, 0.84f, 0.95f);
-    style.Colors[ImGuiCol_Tab] = ImVec4(0.20f, 0.20f, 0.20f, 0.86f);
-    style.Colors[ImGuiCol_TabHovered] = ImVec4(0.40f, 0.40f, 0.40f, 0.80f);
-    style.Colors[ImGuiCol_TabActive] = ImVec4(0.31f, 0.31f, 0.31f, 1.00f);
-    style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.16f, 0.16f, 0.16f, 0.97f);
-    style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
+    // Replace default blue accents with a readable red palette.
+    style.Colors[ImGuiCol_CheckMark] = ImVec4(0.95f, 0.30f, 0.30f, 1.00f);
+    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.88f, 0.28f, 0.28f, 1.00f);
+    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(1.00f, 0.40f, 0.40f, 1.00f);
+    style.Colors[ImGuiCol_Button] = ImVec4(0.38f, 0.16f, 0.16f, 0.72f);
+    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.64f, 0.22f, 0.22f, 1.00f);
+    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.78f, 0.26f, 0.26f, 1.00f);
+    style.Colors[ImGuiCol_Header] = ImVec4(0.45f, 0.17f, 0.17f, 0.70f);
+    style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.68f, 0.24f, 0.24f, 0.88f);
+    style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.80f, 0.28f, 0.28f, 0.95f);
+    style.Colors[ImGuiCol_Separator] = ImVec4(0.58f, 0.20f, 0.20f, 0.58f);
+    style.Colors[ImGuiCol_SeparatorHovered] = ImVec4(0.78f, 0.28f, 0.28f, 0.80f);
+    style.Colors[ImGuiCol_SeparatorActive] = ImVec4(0.92f, 0.34f, 0.34f, 1.00f);
+    style.Colors[ImGuiCol_ResizeGrip] = ImVec4(0.70f, 0.24f, 0.24f, 0.35f);
+    style.Colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.90f, 0.32f, 0.32f, 0.78f);
+    style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(1.00f, 0.38f, 0.38f, 0.95f);
+    style.Colors[ImGuiCol_Tab] = ImVec4(0.28f, 0.12f, 0.12f, 0.90f);
+    style.Colors[ImGuiCol_TabHovered] = ImVec4(0.60f, 0.22f, 0.22f, 0.88f);
+    style.Colors[ImGuiCol_TabActive] = ImVec4(0.48f, 0.18f, 0.18f, 1.00f);
+    style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.18f, 0.10f, 0.10f, 0.97f);
+    style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.33f, 0.14f, 0.14f, 1.00f);
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.55f, 0.20f, 0.20f, 0.80f);
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.45f, 0.18f, 0.18f, 0.80f);
+    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.45f, 0.16f, 0.16f, 1.00f);
+    style.Colors[ImGuiCol_NavHighlight] = ImVec4(0.96f, 0.34f, 0.34f, 1.00f);
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
@@ -401,6 +411,51 @@ static uint32_t GetShaderHashForKey(uintptr_t shaderKey) {
     return HashBytesFNV1a(reinterpret_cast<const uint8_t*>(&shaderKey), sizeof(shaderKey));
 }
 
+static bool IsShaderDisabled(uintptr_t shaderKey) {
+    auto it = g_disabledShaderZeroing.find(shaderKey);
+    return it != g_disabledShaderZeroing.end() && it->second;
+}
+
+static void SetShaderDisabled(uintptr_t shaderKey, bool disabled) {
+    if (shaderKey == 0) {
+        return;
+    }
+    g_disabledShaderZeroing[shaderKey] = disabled;
+}
+
+static float GetShaderFlashStrength(const ShaderConstantState* state) {
+    if (!state || state->lastChangeSerial == 0 || g_constantChangeSerial < state->lastChangeSerial) {
+        return 0.0f;
+    }
+    const unsigned long long age = g_constantChangeSerial - state->lastChangeSerial;
+    if (age > 30ULL) {
+        return 0.0f;
+    }
+    return 1.0f - (static_cast<float>(age) / 30.0f);
+}
+
+static void BuildShaderComboLabel(uintptr_t shaderKey, char* outLabel, size_t outSize) {
+    if (!outLabel || outSize == 0) {
+        return;
+    }
+    ShaderConstantState* state = GetShaderState(shaderKey, false);
+    bool disabled = IsShaderDisabled(shaderKey);
+    float flash = GetShaderFlashStrength(state);
+    uint32_t displayHash = GetShaderHashForKey(shaderKey);
+    snprintf(outLabel, outSize, "0x%p (hash 0x%08X)%s%s%s",
+             reinterpret_cast<void*>(shaderKey),
+             displayHash,
+             shaderKey == g_activeShaderKey ? " (active)" : "",
+             disabled ? " [DISABLED]" : "",
+             flash > 0.0f ? " [changed]" : "");
+}
+
+static void RefreshLogSnapshot() {
+    std::lock_guard<std::mutex> lock(g_uiDataMutex);
+    g_logSnapshot.assign(g_logLines.begin(), g_logLines.end());
+    g_logSnapshotDirty = false;
+}
+
 static void UpdateMatrixSource(MatrixSlot slot,
                                uintptr_t shaderKey,
                                int baseRegister,
@@ -418,13 +473,12 @@ static void UpdateMatrixSource(MatrixSlot slot,
     g_matrixSources[slot] = info;
 }
 
-static void DrawMatrixSourceInfo(MatrixSlot slot, const D3DMATRIX& mat, bool available) {
+static void DrawMatrixSourceInfo(MatrixSlot slot, bool available) {
     if (!available) {
         return;
     }
 
     const MatrixSourceInfo& source = g_matrixSources[slot];
-    ImGui::Text("Matrix hash: 0x%08X", HashMatrix(mat));
     if (!source.valid) {
         ImGui::Text("Source: <unknown>");
         return;
@@ -1230,8 +1284,8 @@ static void RenderImGuiOverlay() {
         float graphMaxMs = (std::max)(33.0f, avgMs * 1.75f);
         ImGui::Text("FPS: %.1f", avgFps);
         ImGui::Text("ms: %.2f", avgMs);
-        ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.72f, 0.28f, 0.28f, 1.00f));
-        ImGui::PushStyleColor(ImGuiCol_PlotLinesHovered, ImVec4(0.86f, 0.40f, 0.40f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(1.00f, 1.00f, 1.00f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_PlotLinesHovered, ImVec4(1.00f, 1.00f, 1.00f, 1.00f));
         ImGui::PlotLines("Frame time (ms)", g_frameTimeHistory, g_frameTimeCount, g_frameTimeIndex,
                          nullptr, 0.0f, graphMaxMs,
                          ImVec2(0, 80));
@@ -1244,26 +1298,28 @@ static void RenderImGuiOverlay() {
     ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "Overseer");
     ImGui::SameLine();
     ImGui::Text("- https://github.com/mencelot/dmc4-camera-proxy");
-    ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "modified by cobalticarus92");
+    ImGui::Text("modified by ");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "cobalticarus92");
 
     ImGui::Separator();
     if (ImGui::BeginTabBar("MainTabs")) {
         if (ImGui::BeginTabItem("Camera")) {
             DrawMatrixWithTranspose("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld,
                                     g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_World, g_cameraMatrices.world, g_cameraMatrices.hasWorld);
+            DrawMatrixSourceInfo(MatrixSlot_World, g_cameraMatrices.hasWorld);
             ImGui::Separator();
             DrawMatrixWithTranspose("View", g_cameraMatrices.view, g_cameraMatrices.hasView,
                                     g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_View, g_cameraMatrices.view, g_cameraMatrices.hasView);
+            DrawMatrixSourceInfo(MatrixSlot_View, g_cameraMatrices.hasView);
             ImGui::Separator();
             DrawMatrixWithTranspose("Projection", g_cameraMatrices.projection,
                                     g_cameraMatrices.hasProjection, g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_Projection, g_cameraMatrices.projection, g_cameraMatrices.hasProjection);
+            DrawMatrixSourceInfo(MatrixSlot_Projection, g_cameraMatrices.hasProjection);
             ImGui::Separator();
             DrawMatrixWithTranspose("MVP", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP,
                                     g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_MVP, g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
+            DrawMatrixSourceInfo(MatrixSlot_MVP, g_cameraMatrices.hasMVP);
             ImGui::EndTabItem();
         }
 
@@ -1277,29 +1333,39 @@ static void RenderImGuiOverlay() {
                 }
             }
             if (!g_shaderOrder.empty()) {
-                char preview[64];
-                uint32_t previewHash = HashBytesFNV1a(reinterpret_cast<const uint8_t*>(&g_selectedShaderKey),
-                                                     sizeof(g_selectedShaderKey));
-                snprintf(preview, sizeof(preview), "0x%p (hash 0x%08X)%s",
-                         reinterpret_cast<void*>(g_selectedShaderKey), previewHash,
-                         g_selectedShaderKey == g_activeShaderKey ? " (active)" : "");
+                char preview[128];
+                BuildShaderComboLabel(g_selectedShaderKey, preview, sizeof(preview));
                 if (ImGui::BeginCombo("Shader", preview)) {
                     for (uintptr_t key : g_shaderOrder) {
-                        char itemLabel[64];
-                        uint32_t itemHash = HashBytesFNV1a(reinterpret_cast<const uint8_t*>(&key), sizeof(key));
-                        snprintf(itemLabel, sizeof(itemLabel), "0x%p (hash 0x%08X)%s",
-                                 reinterpret_cast<void*>(key), itemHash,
-                                 key == g_activeShaderKey ? " (active)" : "");
+                        char itemLabel[128];
+                        BuildShaderComboLabel(key, itemLabel, sizeof(itemLabel));
+                        ShaderConstantState* itemState = GetShaderState(key, false);
+                        float flashStrength = GetShaderFlashStrength(itemState);
+                        if (flashStrength > 0.0f) {
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                                  ImVec4(1.00f,
+                                                         0.35f + 0.45f * flashStrength,
+                                                         0.35f + 0.45f * flashStrength,
+                                                         1.00f));
+                        }
                         bool selected = (key == g_selectedShaderKey);
                         if (ImGui::Selectable(itemLabel, selected)) {
                             g_selectedShaderKey = key;
                             g_selectedRegister = -1;
+                        }
+                        if (flashStrength > 0.0f) {
+                            ImGui::PopStyleColor();
                         }
                         if (selected) {
                             ImGui::SetItemDefaultFocus();
                         }
                     }
                     ImGui::EndCombo();
+                }
+                ImGui::SameLine();
+                bool disableSelected = IsShaderDisabled(g_selectedShaderKey);
+                if (ImGui::Checkbox("Disable shader (zero constants)", &disableSelected)) {
+                    SetShaderDisabled(g_selectedShaderKey, disableSelected);
                 }
             } else {
                 ImGui::Text("<no shader constants captured yet>");
@@ -1622,20 +1688,32 @@ static void RenderImGuiOverlay() {
         }
 
         if (ImGui::BeginTabItem("Logs")) {
+            ImGui::Checkbox("Live update", &g_logsLiveUpdate);
+            ImGui::SameLine();
+            if (ImGui::Button("Refresh")) {
+                RefreshLogSnapshot();
+            }
+            ImGui::SameLine();
             if (ImGui::Button("Clear logs")) {
                 std::lock_guard<std::mutex> lock(g_uiDataMutex);
                 g_logLines.clear();
+                g_logSnapshot.clear();
+                g_logSnapshotDirty = false;
+            }
+            if (g_logsLiveUpdate && g_logSnapshotDirty) {
+                RefreshLogSnapshot();
+            } else if (!g_logsLiveUpdate && g_logSnapshot.empty() && g_logSnapshotDirty) {
+                RefreshLogSnapshot();
             }
             ImGui::Separator();
             ImGui::BeginChild("FormattedLogs", ImVec2(0, 380), true);
-            {
-                std::lock_guard<std::mutex> lock(g_uiDataMutex);
-                if (g_logLines.empty()) {
-                    ImGui::Text("<no logs>");
-                } else {
-                    for (const std::string& line : g_logLines) {
-                        ImGui::TextWrapped("%s", line.c_str());
-                    }
+            if (g_logSnapshot.empty()) {
+                ImGui::Text("<no logs>");
+            } else {
+                for (const std::string& line : g_logSnapshot) {
+                    ImGui::TextWrapped("%s", line.c_str());
+                }
+                if (g_logsLiveUpdate) {
                     ImGui::SetScrollHereY(1.0f);
                 }
             }
@@ -1682,6 +1760,7 @@ static void AppendUiLogLine(const char* text) {
     }
     std::lock_guard<std::mutex> lock(g_uiDataMutex);
     g_logLines.emplace_back(text);
+    g_logSnapshotDirty = true;
     while (g_logLines.size() > kMaxUiLogLines) {
         g_logLines.pop_front();
     }
@@ -1976,19 +2055,37 @@ public:
         ShaderConstantState* state = GetShaderState(shaderKey, true);
 
         std::vector<float> overrideScratch;
+        std::vector<float> disabledScratch;
         const float* effectiveConstantData = pConstantData;
         if (BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
             effectiveConstantData = overrideScratch.data();
         }
+
+        if (IsShaderDisabled(shaderKey) && Vector4fCount > 0) {
+            disabledScratch.assign(Vector4fCount * 4, 0.0f);
+            effectiveConstantData = disabledScratch.data();
+        }
+
+        bool constantsChanged = false;
 
         for (UINT i = 0; i < Vector4fCount; i++) {
             UINT reg = StartRegister + i;
             if (reg >= kMaxConstantRegisters) {
                 break;
             }
+            if (!constantsChanged) {
+                if (!state->valid[reg] ||
+                    memcmp(state->constants[reg], effectiveConstantData + i * 4,
+                           sizeof(state->constants[reg])) != 0) {
+                    constantsChanged = true;
+                }
+            }
             memcpy(state->constants[reg], effectiveConstantData + i * 4, sizeof(state->constants[reg]));
             state->valid[reg] = true;
             UpdateVariance(*state, static_cast<int>(reg), effectiveConstantData + i * 4);
+        }
+        if (constantsChanged) {
+            state->lastChangeSerial = ++g_constantChangeSerial;
         }
         state->snapshotReady = true;
 
