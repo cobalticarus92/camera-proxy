@@ -238,6 +238,16 @@ static bool g_perfInitialized = false;
 static std::deque<std::string> g_logLines = {};
 static std::vector<std::string> g_logSnapshot = {};
 static std::vector<std::string> g_memoryScanResults = {};
+
+struct MemoryScanHit {
+    std::string label;
+    D3DMATRIX matrix = {};
+    MatrixSlot slot = MatrixSlot_View;
+    uintptr_t address = 0;
+    uint32_t hash = 0;
+};
+
+static std::vector<MemoryScanHit> g_memoryScanHits = {};
 static std::mutex g_uiDataMutex;
 static constexpr size_t kMaxUiLogLines = 600;
 static bool g_logsLiveUpdate = false;
@@ -421,6 +431,9 @@ static uint32_t HashMatrix(const D3DMATRIX& mat) {
 }
 
 static uint32_t GetShaderHashForKey(uintptr_t shaderKey) {
+    if (shaderKey == 0) {
+        return 0;
+    }
     auto it = g_shaderBytecodeHashes.find(shaderKey);
     if (it != g_shaderBytecodeHashes.end()) {
         return it->second;
@@ -505,7 +518,11 @@ static void DrawMatrixSourceInfo(MatrixSlot slot, bool available) {
         return;
     }
 
-    ImGui::Text("Source shader: 0x%p (hash 0x%08X)", reinterpret_cast<void*>(source.shaderKey), source.shaderHash);
+    if (source.shaderKey == 0) {
+        ImGui::Text("Source shader: <unknown>");
+    } else {
+        ImGui::Text("Source shader: 0x%p (hash 0x%08X)", reinterpret_cast<void*>(source.shaderKey), source.shaderHash);
+    }
     if (source.baseRegister >= 0) {
         ImGui::Text("Registers: c%d-c%d (%d rows)%s",
                     source.baseRegister,
@@ -1376,6 +1393,13 @@ static void ScanBuffer(const void* base, size_t size, int& resultsFound) {
         {
             std::lock_guard<std::mutex> lock(g_uiDataMutex);
             g_memoryScanResults.emplace_back(resultLine);
+            MemoryScanHit hit = {};
+            hit.label = resultLine;
+            hit.matrix = mat;
+            hit.slot = looksView ? MatrixSlot_View : MatrixSlot_Projection;
+            hit.address = reinterpret_cast<uintptr_t>(window);
+            hit.hash = hash;
+            g_memoryScanHits.emplace_back(hit);
         }
         resultsFound++;
         if (resultsFound >= g_config.memoryScannerMaxResults) {
@@ -1439,6 +1463,7 @@ static void StartMemoryScanner() {
     {
         std::lock_guard<std::mutex> lock(g_uiDataMutex);
         g_memoryScanResults.clear();
+        g_memoryScanHits.clear();
     }
     char* moduleCopy = nullptr;
     if (moduleName) {
@@ -2095,17 +2120,35 @@ static void RenderImGuiOverlay() {
             if (ImGui::Button("Clear results")) {
                 std::lock_guard<std::mutex> lock(g_uiDataMutex);
                 g_memoryScanResults.clear();
+                g_memoryScanHits.clear();
             }
             ImGui::Separator();
             ImGui::Text("Memory scan output");
             ImGui::BeginChild("MemoryScanResults", ImVec2(0, 360), true);
             {
                 std::lock_guard<std::mutex> lock(g_uiDataMutex);
-                if (g_memoryScanResults.empty()) {
+                if (g_memoryScanHits.empty()) {
                     ImGui::Text("<no scan results>");
                 } else {
-                    for (const std::string& line : g_memoryScanResults) {
-                        ImGui::TextWrapped("%s", line.c_str());
+                    for (size_t i = 0; i < g_memoryScanHits.size(); ++i) {
+                        const MemoryScanHit& hit = g_memoryScanHits[i];
+                        ImGui::PushID(static_cast<int>(i));
+                        ImGui::TextWrapped("%s", hit.label.c_str());
+                        if (ImGui::Button("Use as View")) {
+                            StoreViewMatrix(hit.matrix, 0, -1, 4, false, true);
+                            snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                                     "Assigned VIEW from memory scan @ 0x%p (hash 0x%08X).",
+                                     reinterpret_cast<void*>(hit.address), hit.hash);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Use as Projection")) {
+                            StoreProjectionMatrix(hit.matrix, 0, -1, 4, false, true);
+                            snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                                     "Assigned PROJECTION from memory scan @ 0x%p (hash 0x%08X).",
+                                     reinterpret_cast<void*>(hit.address), hit.hash);
+                        }
+                        ImGui::PopID();
+                        ImGui::Separator();
                     }
                 }
             }
@@ -2698,7 +2741,7 @@ public:
                         memcpy(&mat, matData, sizeof(D3DMATRIX));
 
                         auto observe4x4Variant = [&](const D3DMATRIX& candidate, bool transposed) {
-                            bool projStrict = LooksLikeProjectionStrict(candidate) && PassesPerspectiveHeuristics(candidate);
+                            bool projStrict = LooksLikeProjectionStrict(candidate);
                             bool projLike = !projStrict && ComputeProjectionLikeScore(candidate) > 1.0f &&
                                             PassesPerspectiveHeuristics(candidate);
                             bool viewStrict = LooksLikeViewStrict(candidate);
@@ -2707,6 +2750,9 @@ public:
                             if (!viewLike && g_probeInverseView) {
                                 D3DMATRIX inv = InvertSimpleRigidView(candidate);
                                 if (LooksLikeViewStrict(inv) || LooksLikeView(inv)) {
+                                    if (shaderKey == 0) {
+                                        return;
+                                    }
                                     AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 4, transposed, MatrixSlot_View};
                                     ObserveAutoCandidate(key, inv);
                                     m_pendingViewCandidate = key;
@@ -2716,6 +2762,9 @@ public:
                             }
 
                             if (projStrict || projLike) {
+                                if (shaderKey == 0) {
+                                    return;
+                                }
                                 float fov = ExtractFOV(candidate);
                                 AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 4, transposed, MatrixSlot_Projection};
                                 ObserveAutoCandidate(key, candidate, fov);
@@ -2723,14 +2772,19 @@ public:
                                 m_hasPendingProjCandidate = true;
                                 UpdateStability(*state, static_cast<int>(reg), false, projStrict);
                             } else if (viewLike) {
+                                if (shaderKey == 0) {
+                                    return;
+                                }
                                 AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 4, transposed, MatrixSlot_View};
                                 ObserveAutoCandidate(key, candidate);
                                 m_pendingViewCandidate = key;
                                 m_hasPendingViewCandidate = true;
                                 UpdateStability(*state, static_cast<int>(reg), viewStrict, false);
                             } else if (g_autoDetectMode == AutoDetect_IndividualWVP) {
-                                AutoCandidateKey worldKey = {shaderKey, static_cast<int>(reg), 4, transposed, MatrixSlot_World};
-                                ObserveAutoCandidate(worldKey, candidate);
+                                if (shaderKey != 0) {
+                                    AutoCandidateKey worldKey = {shaderKey, static_cast<int>(reg), 4, transposed, MatrixSlot_World};
+                                    ObserveAutoCandidate(worldKey, candidate);
+                                }
                             }
                         };
 
@@ -2740,15 +2794,17 @@ public:
                         }
 
                         if (g_autoDetectMode == AutoDetect_MVPOnly && reg == 0) {
-                            AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 4, false, MatrixSlot_MVP};
-                            ObserveAutoCandidate(key, mat);
-                            m_pendingMVPCandidate = key;
-                            m_hasPendingMVPCandidate = true;
-                            if (g_probeTransposedLayouts) {
-                                AutoCandidateKey keyT = {shaderKey, static_cast<int>(reg), 4, true, MatrixSlot_MVP};
-                                ObserveAutoCandidate(keyT, TransposeMatrix(mat));
-                                m_pendingMVPCandidate = keyT;
+                            if (shaderKey != 0) {
+                                AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 4, false, MatrixSlot_MVP};
+                                ObserveAutoCandidate(key, mat);
+                                m_pendingMVPCandidate = key;
                                 m_hasPendingMVPCandidate = true;
+                                if (g_probeTransposedLayouts) {
+                                    AutoCandidateKey keyT = {shaderKey, static_cast<int>(reg), 4, true, MatrixSlot_MVP};
+                                    ObserveAutoCandidate(keyT, TransposeMatrix(mat));
+                                    m_pendingMVPCandidate = keyT;
+                                    m_hasPendingMVPCandidate = true;
+                                }
                             }
                         }
                     }
@@ -2760,10 +2816,12 @@ public:
                                                          static_cast<int>(reg), 3, false, &mat43)) {
                         auto observe4x3Variant = [&](const D3DMATRIX& candidate, bool transposed) {
                             if (LooksLikeViewStrict(candidate) || LooksLikeView(candidate)) {
-                                AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 3, transposed, MatrixSlot_View};
-                                ObserveAutoCandidate(key, candidate);
-                                m_pendingViewCandidate = key;
-                                m_hasPendingViewCandidate = true;
+                                if (shaderKey != 0) {
+                                    AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 3, transposed, MatrixSlot_View};
+                                    ObserveAutoCandidate(key, candidate);
+                                    m_pendingViewCandidate = key;
+                                    m_hasPendingViewCandidate = true;
+                                }
                             }
                         };
                         observe4x3Variant(mat43, false);
@@ -2771,10 +2829,12 @@ public:
                             observe4x3Variant(TransposeMatrix(mat43), true);
                         }
                         if (g_autoDetectMode == AutoDetect_MVPOnly) {
-                            AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 3, false, MatrixSlot_MVP};
-                            ObserveAutoCandidate(key, mat43);
-                            m_pendingMVPCandidate = key;
-                            m_hasPendingMVPCandidate = true;
+                            if (shaderKey != 0) {
+                                AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 3, false, MatrixSlot_MVP};
+                                ObserveAutoCandidate(key, mat43);
+                                m_pendingMVPCandidate = key;
+                                m_hasPendingMVPCandidate = true;
+                            }
                         }
                     }
                 }
