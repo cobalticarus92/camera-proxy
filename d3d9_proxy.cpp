@@ -2361,18 +2361,6 @@ static bool LooksLikeProjectionStrict(const D3DMATRIX& m) {
 
     return true;
 }
-
-
-
-static D3DMATRIX TransposeMatrix(const D3DMATRIX& m) {
-    D3DMATRIX t = {};
-    t._11 = m._11; t._12 = m._21; t._13 = m._31; t._14 = m._41;
-    t._21 = m._12; t._22 = m._22; t._23 = m._32; t._24 = m._42;
-    t._31 = m._13; t._32 = m._23; t._33 = m._33; t._34 = m._43;
-    t._41 = m._14; t._42 = m._24; t._43 = m._34; t._44 = m._44;
-    return t;
-}
-
 static bool HasPerspectiveComponent(const D3DMATRIX& m) {
     return fabsf(m._34) > 0.5f && fabsf(m._44) < 0.5f;
 }
