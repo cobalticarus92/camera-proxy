@@ -43,6 +43,21 @@ static void LogMsg(const char* fmt, ...);
 static bool LooksLikeViewStrict(const D3DMATRIX& m);
 static bool LooksLikeProjectionStrict(const D3DMATRIX& m);
 float ExtractFOV(const D3DMATRIX& proj);
+
+enum ProjectionHandedness {
+    ProjectionHandedness_Unknown = 0,
+    ProjectionHandedness_Left,
+    ProjectionHandedness_Right
+};
+
+struct ProjectionAnalysis {
+    bool valid = false;
+    float fovRadians = 0.0f;
+    ProjectionHandedness handedness = ProjectionHandedness_Unknown;
+};
+
+static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysis* out);
+static const char* ProjectionHandednessLabel(ProjectionHandedness handedness);
 class WrappedD3D9Device;
 
 #pragma comment(lib, "user32.lib")
@@ -165,6 +180,10 @@ static int g_autoDetectSamplingFrames = 180;
 static int g_autoDetectSamplingStartFrame = -1;
 static bool g_autoDetectSamplingActive = false;
 static bool g_autoDetectSamplingPausedByUser = false;
+static bool g_projectionDetectedByNumericStructure = false;
+static float g_projectionDetectedFovRadians = 0.0f;
+static int g_projectionDetectedRegister = -1;
+static ProjectionHandedness g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
 
 enum HotkeyAction {
     HotkeyAction_ToggleMenu = 0,
@@ -1916,6 +1935,18 @@ static void RenderImGuiOverlay() {
             DrawMatrixWithTranspose("Projection", g_cameraMatrices.projection,
                                     g_cameraMatrices.hasProjection, g_showTransposedMatrices);
             DrawMatrixSourceInfo(MatrixSlot_Projection, g_cameraMatrices.hasProjection);
+            if (g_projectionDetectedByNumericStructure) {
+                ImGui::Text("Projection numeric detection: ACTIVE");
+                ImGui::Text("FOV: %.2f deg (%.3f rad)",
+                            g_projectionDetectedFovRadians * 180.0f / 3.14159265f,
+                            g_projectionDetectedFovRadians);
+                ImGui::Text("Handedness: %s", ProjectionHandednessLabel(g_projectionDetectedHandedness));
+                if (g_projectionDetectedRegister >= 0) {
+                    ImGui::Text("Detected register: c%d", g_projectionDetectedRegister);
+                }
+            } else {
+                ImGui::Text("Projection numeric detection: waiting for structural match");
+            }
             ImGui::Separator();
             DrawMatrixWithTranspose("MVP", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP,
                                     g_showTransposedMatrices);
@@ -2454,17 +2485,63 @@ static bool LooksLikeViewStrict(const D3DMATRIX& m) {
 }
 
 static bool LooksLikeProjectionStrict(const D3DMATRIX& m) {
-    if (fabsf(m._12) > 0.01f || fabsf(m._13) > 0.01f || fabsf(m._14) > 0.01f) return false;
-    if (fabsf(m._21) > 0.01f || fabsf(m._23) > 0.01f || fabsf(m._24) > 0.01f) return false;
-    if (fabsf(m._31) > 0.01f || fabsf(m._32) > 0.01f) return false;
-    if (fabsf(m._11) < 0.01f || fabsf(m._22) < 0.01f) return false;
-    if (fabsf(m._34 - 1.0f) > 0.05f) return false;
-    if (fabsf(m._44) > 0.05f) return false;
+    return AnalyzeProjectionMatrixNumeric(m, nullptr);
+}
 
-    float fov = ExtractFOV(m);
-    if (fov < g_config.minFOV || fov > g_config.maxFOV) return false;
+static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysis* out) {
+    constexpr float kZeroEpsilon = 0.02f;
+    constexpr float kPerspectiveEpsilon = 0.05f;
 
+    if (!std::isfinite(m._11) || !std::isfinite(m._22) || !std::isfinite(m._33) ||
+        !std::isfinite(m._34) || !std::isfinite(m._43) || !std::isfinite(m._44)) {
+        return false;
+    }
+
+    if (fabsf(m._12) > kZeroEpsilon || fabsf(m._13) > kZeroEpsilon ||
+        fabsf(m._21) > kZeroEpsilon || fabsf(m._23) > kZeroEpsilon ||
+        fabsf(m._31) > kZeroEpsilon || fabsf(m._32) > kZeroEpsilon) {
+        return false;
+    }
+
+    if (fabsf(m._14) > kZeroEpsilon || fabsf(m._24) > kZeroEpsilon) {
+        return false;
+    }
+
+    if (fabsf(fabsf(m._34) - 1.0f) > kPerspectiveEpsilon) {
+        return false;
+    }
+
+    if (fabsf(m._44) > kPerspectiveEpsilon) {
+        return false;
+    }
+
+    if (fabsf(m._11) < 0.001f || fabsf(m._22) < 0.001f) {
+        return false;
+    }
+
+    if (fabsf(m._33) < 0.0001f || fabsf(m._43) < 0.0001f) {
+        return false;
+    }
+
+    const float fov = 2.0f * atanf(1.0f / fabsf(m._22));
+    if (!std::isfinite(fov) || fov < g_config.minFOV || fov > g_config.maxFOV) {
+        return false;
+    }
+
+    if (out) {
+        out->valid = true;
+        out->fovRadians = fov;
+        out->handedness = (m._34 >= 0.0f) ? ProjectionHandedness_Left : ProjectionHandedness_Right;
+    }
     return true;
+}
+
+static const char* ProjectionHandednessLabel(ProjectionHandedness handedness) {
+    switch (handedness) {
+        case ProjectionHandedness_Left: return "LH";
+        case ProjectionHandedness_Right: return "RH";
+        default: return "Unknown";
+    }
 }
 
 static bool HasPerspectiveComponent(const D3DMATRIX& m) {
@@ -2603,21 +2680,12 @@ static bool MatrixClose(const D3DMATRIX& a, const D3DMATRIX& b, float tolerance)
 // Extract FOV from projection matrix
 float ExtractFOV(const D3DMATRIX& proj) {
     if (fabsf(proj._22) < 0.001f) return 0;
-    return 2.0f * atanf(1.0f / proj._22);
+    return 2.0f * atanf(1.0f / fabsf(proj._22));
 }
 
 // Check if matrix looks like projection
 bool LooksLikeProjection(const D3DMATRIX& m) {
-    // Check for typical projection structure
-    if (fabsf(m._12) > 0.01f || fabsf(m._13) > 0.01f || fabsf(m._14) > 0.01f) return false;
-    if (fabsf(m._21) > 0.01f || fabsf(m._23) > 0.01f || fabsf(m._24) > 0.01f) return false;
-    if (fabsf(m._31) > 0.01f || fabsf(m._32) > 0.01f) return false;
-    if (fabsf(m._11) < 0.01f || fabsf(m._22) < 0.01f) return false;
-
-    float fov = ExtractFOV(m);
-    if (fov < g_config.minFOV || fov > g_config.maxFOV) return false;
-
-    return true;
+    return AnalyzeProjectionMatrixNumeric(m, nullptr);
 }
 
 // Create a standard perspective projection matrix
@@ -2813,6 +2881,10 @@ public:
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = manualMat;
                     m_hasProj = true;
+                    g_projectionDetectedByNumericStructure = false;
+                    g_projectionDetectedRegister = binding.baseRegister;
+                    g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                    g_projectionDetectedFovRadians = 0.0f;
                     StoreProjectionMatrix(m_currentProj, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_MVP) {
                     StoreMVPMatrix(manualMat, shaderKey, binding.baseRegister, binding.rows, false, true);
@@ -2847,6 +2919,10 @@ public:
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = mat;
                     m_hasProj = true;
+                    g_projectionDetectedByNumericStructure = false;
+                    g_projectionDetectedRegister = configuredRegister;
+                    g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                    g_projectionDetectedFovRadians = 0.0f;
                     StoreProjectionMatrix(m_currentProj, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                           "explicit register override");
                 }
@@ -2862,10 +2938,23 @@ public:
             MatrixClassification cls = ClassifyMatrixDeterministic(mat, rows, Vector4fCount, StartRegister, baseReg);
 
             if (cls == MatrixClass_Projection && g_config.projMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_Projection]) {
+                ProjectionAnalysis projectionInfo = {};
+                if (!AnalyzeProjectionMatrixNumeric(mat, &projectionInfo)) {
+                    return;
+                }
                 m_currentProj = mat;
                 m_hasProj = true;
                 slotResolvedStructurally[MatrixSlot_Projection] = true;
+                g_projectionDetectedByNumericStructure = true;
+                g_projectionDetectedFovRadians = projectionInfo.fovRadians;
+                g_projectionDetectedRegister = static_cast<int>(baseReg);
+                g_projectionDetectedHandedness = projectionInfo.handedness;
                 StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural projection");
+                LogMsg("Projection accepted via numeric structure: c%d-c%d rows=%d transpose=%d fov=%.2f deg (%s)",
+                       static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1,
+                       rows, transposed ? 1 : 0,
+                       projectionInfo.fovRadians * 180.0f / 3.14159265f,
+                       ProjectionHandednessLabel(projectionInfo.handedness));
             } else if (cls == MatrixClass_View && g_config.viewMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_View]) {
                 m_currentView = mat;
                 m_hasView = true;
@@ -2890,6 +2979,10 @@ public:
                 slotResolvedStructurally[MatrixSlot_World] = true;
                 slotResolvedStructurally[MatrixSlot_View] = true;
                 slotResolvedStructurally[MatrixSlot_Projection] = true;
+                g_projectionDetectedByNumericStructure = false;
+                g_projectionDetectedRegister = static_cast<int>(baseReg);
+                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                g_projectionDetectedFovRadians = 0.0f;
                 StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic combined VP/MVP fallback");
             }
         };
@@ -2956,6 +3049,10 @@ public:
                 if (TryBuildMatrixSnapshot(*state, top.base, 4, top.transposed, &proj) && LooksLikeProjectionStrict(proj)) {
                     m_currentProj = proj;
                     m_hasProj = true;
+                    g_projectionDetectedByNumericStructure = false;
+                    g_projectionDetectedRegister = top.base;
+                    g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                    g_projectionDetectedFovRadians = ExtractFOV(proj);
                     StoreProjectionMatrix(m_currentProj, shaderKey, top.base, 4,
                                           top.transposed, false, "legacy heuristic fallback projection");
                 }
