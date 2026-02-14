@@ -220,6 +220,7 @@ static bool g_isRenderingImGui = false;
 static WNDPROC g_imguiPrevWndProc = nullptr;
 static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
+static bool g_showAllConstantRegisters = false;
 static bool g_showFpsStats = false;
 static bool g_showTransposedMatrices = false;
 static float g_imguiScaleRuntime = 1.0f;
@@ -298,12 +299,29 @@ struct ShaderConstantState {
     unsigned long long lastChangeSerial = 0;
 };
 
+enum ConstantUploadStage {
+    ConstantUploadStage_Vertex = 0,
+    ConstantUploadStage_Pixel = 1
+};
+
+struct ConstantUploadEvent {
+    ConstantUploadStage stage = ConstantUploadStage_Vertex;
+    uintptr_t shaderKey = 0;
+    uint32_t shaderHash = 0;
+    UINT startRegister = 0;
+    UINT vectorCount = 0;
+    unsigned long long changeSerial = 0;
+};
+
 static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMissing);
 
 static std::unordered_map<uintptr_t, ShaderConstantState> g_shaderConstants = {};
 static std::vector<uintptr_t> g_shaderOrder = {};
 static std::unordered_map<uintptr_t, bool> g_disabledShaders = {};
 static unsigned long long g_constantChangeSerial = 0;
+static unsigned long long g_constantUploadSerial = 0;
+static std::deque<ConstantUploadEvent> g_constantUploadEvents = {};
+static constexpr size_t kMaxConstantUploadEvents = 2000;
 static HANDLE g_memoryScannerThread = nullptr;
 static DWORD g_memoryScannerThreadId = 0;
 static DWORD g_memoryScannerLastTick = 0;
@@ -591,6 +609,29 @@ static uint32_t GetShaderHashForKey(uintptr_t shaderKey) {
         return hash;
     }
     return HashBytesFNV1a(reinterpret_cast<const uint8_t*>(&shaderKey), sizeof(shaderKey));
+}
+
+static const char* ConstantUploadStageLabel(ConstantUploadStage stage) {
+    return stage == ConstantUploadStage_Pixel ? "PS" : "VS";
+}
+
+static void RecordConstantUpload(ConstantUploadStage stage,
+                                 uintptr_t shaderKey,
+                                 UINT startRegister,
+                                 UINT vectorCount) {
+    ConstantUploadEvent ev = {};
+    ev.stage = stage;
+    ev.shaderKey = shaderKey;
+    ev.shaderHash = GetShaderHashForKey(shaderKey);
+    ev.startRegister = startRegister;
+    ev.vectorCount = vectorCount;
+    ev.changeSerial = ++g_constantUploadSerial;
+
+    std::lock_guard<std::mutex> lock(g_uiDataMutex);
+    g_constantUploadEvents.emplace_back(ev);
+    while (g_constantUploadEvents.size() > kMaxConstantUploadEvents) {
+        g_constantUploadEvents.pop_front();
+    }
 }
 
 static bool IsShaderDisabled(uintptr_t shaderKey) {
@@ -1856,6 +1897,13 @@ static void RenderImGuiOverlay() {
                 ImGui::Text("<no shader constants captured yet>");
             }
 
+            ImGui::Checkbox("Show all constant uploads (VS/PS, all shaders)", &g_showAllConstantRegisters);
+            ImGui::SameLine();
+            if (ImGui::Button("Clear upload history")) {
+                std::lock_guard<std::mutex> lock(g_uiDataMutex);
+                g_constantUploadEvents.clear();
+            }
+
             ImGui::Checkbox("Group by 4-register matrices", &g_showConstantsAsMatrices);
             ImGui::SameLine();
             ImGui::Checkbox("Only show detected matrices", &g_filterDetectedMatrices);
@@ -1916,7 +1964,38 @@ static void RenderImGuiOverlay() {
 
             ImGui::BeginChild("ConstantsScroll", ImVec2(0, 270), true);
             ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
-            if (state && state->snapshotReady) {
+            if (g_showAllConstantRegisters) {
+                std::vector<ConstantUploadEvent> events;
+                {
+                    std::lock_guard<std::mutex> lock(g_uiDataMutex);
+                    events.assign(g_constantUploadEvents.begin(), g_constantUploadEvents.end());
+                }
+                if (events.empty()) {
+                    ImGui::Text("<no constant uploads captured yet>");
+                } else {
+                    ImGui::Text("Latest constant uploads (newest first):");
+                    for (int idx = static_cast<int>(events.size()) - 1; idx >= 0; --idx) {
+                        const ConstantUploadEvent& ev = events[static_cast<size_t>(idx)];
+                        const UINT endRegister = ev.vectorCount > 0 ? (ev.startRegister + ev.vectorCount - 1) : ev.startRegister;
+                        char itemLabel[256] = {};
+                        snprintf(itemLabel, sizeof(itemLabel),
+                                 "%s c%u-c%u (%u vectors) | shader 0x%p | hash 0x%08X###upload_%llu",
+                                 ConstantUploadStageLabel(ev.stage),
+                                 ev.startRegister,
+                                 endRegister,
+                                 ev.vectorCount,
+                                 reinterpret_cast<void*>(ev.shaderKey),
+                                 ev.shaderHash,
+                                 ev.changeSerial);
+                        if (ImGui::Selectable(itemLabel, false)) {
+                            if (ev.shaderKey != 0) {
+                                g_selectedShaderKey = ev.shaderKey;
+                            }
+                            g_selectedRegister = static_cast<int>(ev.startRegister);
+                        }
+                    }
+                }
+            } else if (state && state->snapshotReady) {
                 if (g_showConstantsAsMatrices) {
                     for (int base = 0; base < kMaxConstantRegisters; base += 4) {
                         D3DMATRIX mat = {};
@@ -2791,6 +2870,7 @@ private:
     D3DMATRIX m_currentWorld;
     HWND m_hwnd = nullptr;
     IDirect3DVertexShader9* m_currentVertexShader = nullptr;
+    IDirect3DPixelShader9* m_currentPixelShader = nullptr;
     bool m_hasView = false;
     bool m_hasProj = false;
     bool m_hasWorld = false;
@@ -2934,6 +3014,7 @@ public:
         UINT Vector4fCount) override
     {
         uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
+        RecordConstantUpload(ConstantUploadStage_Vertex, shaderKey, StartRegister, Vector4fCount);
         ShaderConstantState* state = GetShaderState(shaderKey, true);
         const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
 
@@ -3630,9 +3711,16 @@ public:
     HRESULT STDMETHODCALLTYPE SetIndices(IDirect3DIndexBuffer9* pIndexData) override { return m_real->SetIndices(pIndexData); }
     HRESULT STDMETHODCALLTYPE GetIndices(IDirect3DIndexBuffer9** ppIndexData) override { return m_real->GetIndices(ppIndexData); }
     HRESULT STDMETHODCALLTYPE CreatePixelShader(const DWORD* pFunction, IDirect3DPixelShader9** ppShader) override { return m_real->CreatePixelShader(pFunction, ppShader); }
-    HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DPixelShader9* pShader) override { return m_real->SetPixelShader(pShader); }
+    HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DPixelShader9* pShader) override {
+        m_currentPixelShader = pShader;
+        return m_real->SetPixelShader(pShader);
+    }
     HRESULT STDMETHODCALLTYPE GetPixelShader(IDirect3DPixelShader9** ppShader) override { return m_real->GetPixelShader(ppShader); }
-    HRESULT STDMETHODCALLTYPE SetPixelShaderConstantF(UINT StartRegister, const float* pConstantData, UINT Vector4fCount) override { return m_real->SetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount); }
+    HRESULT STDMETHODCALLTYPE SetPixelShaderConstantF(UINT StartRegister, const float* pConstantData, UINT Vector4fCount) override {
+        uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentPixelShader);
+        RecordConstantUpload(ConstantUploadStage_Pixel, shaderKey, StartRegister, Vector4fCount);
+        return m_real->SetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount);
+    }
     HRESULT STDMETHODCALLTYPE GetPixelShaderConstantF(UINT StartRegister, float* pConstantData, UINT Vector4fCount) override { return m_real->GetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount); }
     HRESULT STDMETHODCALLTYPE SetPixelShaderConstantI(UINT StartRegister, const int* pConstantData, UINT Vector4iCount) override { return m_real->SetPixelShaderConstantI(StartRegister, pConstantData, Vector4iCount); }
     HRESULT STDMETHODCALLTYPE GetPixelShaderConstantI(UINT StartRegister, int* pConstantData, UINT Vector4iCount) override { return m_real->GetPixelShaderConstantI(StartRegister, pConstantData, Vector4iCount); }
