@@ -94,6 +94,17 @@ struct ProxyConfig {
     bool combinedMVPAssumeIdentityWorld = true;
     bool combinedMVPForceDecomposition = false;
     bool combinedMVPLogDecomposition = false;
+
+    bool experimentalCustomProjectionEnabled = false;
+    int experimentalCustomProjectionMode = 2; // 1 = manual matrix, 2 = auto-generated
+    bool experimentalCustomProjectionOverrideDetectedProjection = false;
+    bool experimentalCustomProjectionOverrideCombinedMVP = false;
+    float experimentalCustomProjectionAutoFovDeg = 60.0f;
+    float experimentalCustomProjectionAutoNearZ = 0.1f;
+    float experimentalCustomProjectionAutoFarZ = 1000.0f;
+    float experimentalCustomProjectionAutoAspectFallback = 16.0f / 9.0f;
+    int experimentalCustomProjectionAutoHandedness = ProjectionHandedness_Left;
+    D3DMATRIX experimentalCustomProjectionManualMatrix = {};
 };
 
 enum CombinedMVPStrategy {
@@ -230,6 +241,7 @@ static float g_projectionDetectedFovRadians = 0.0f;
 static int g_projectionDetectedRegister = -1;
 static ProjectionHandedness g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
 static CombinedMVPDebugState g_combinedMvpDebug = {};
+static char g_customProjectionStatus[256] = "";
 
 enum HotkeyAction {
     HotkeyAction_ToggleMenu = 0,
@@ -746,6 +758,19 @@ static bool SaveConfigRegisterValue(const char* key, int value) {
 
 static bool SaveConfigBoolValue(const char* key, bool value) {
     return SaveConfigRegisterValue(key, value ? 1 : 0);
+}
+
+static bool SaveConfigFloatValue(const char* key, float value) {
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    char* lastSlash = strrchr(path, '\\');
+    if (lastSlash) {
+        strcpy(lastSlash + 1, "camera_proxy.ini");
+    }
+
+    char valueBuf[64] = {};
+    snprintf(valueBuf, sizeof(valueBuf), "%.7g", value);
+    return WritePrivateProfileStringA("CameraProxy", key, valueBuf, path) != FALSE;
 }
 
 static bool ConsumeSingleKeyHotkey(HotkeyAction action, int virtualKey) {
@@ -1658,6 +1683,90 @@ static void RenderImGuiOverlay() {
             } else {
                 ImGui::Text("Projection numeric detection: waiting for structural match");
             }
+
+            if (ImGui::CollapsingHeader("Experimental custom projection", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::TextWrapped("This feature is experimental and must be enabled in camera_proxy.ini. "
+                                   "By default it only supplies projection when no register-sourced projection is available.");
+                ImGui::Text("Enabled in ini: %s", g_config.experimentalCustomProjectionEnabled ? "yes" : "no");
+                if (!g_config.experimentalCustomProjectionEnabled) {
+                    ImGui::TextWrapped("Set ExperimentalCustomProjectionEnabled=1 in camera_proxy.ini to activate this section.");
+                } else {
+                    if (ImGui::RadioButton("Manual matrix", g_config.experimentalCustomProjectionMode == 1)) {
+                        g_config.experimentalCustomProjectionMode = 1;
+                        SaveConfigRegisterValue("ExperimentalCustomProjectionMode", g_config.experimentalCustomProjectionMode);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::RadioButton("Auto-generate", g_config.experimentalCustomProjectionMode == 2)) {
+                        g_config.experimentalCustomProjectionMode = 2;
+                        SaveConfigRegisterValue("ExperimentalCustomProjectionMode", g_config.experimentalCustomProjectionMode);
+                    }
+
+                    if (ImGui::Checkbox("Override detected projection", &g_config.experimentalCustomProjectionOverrideDetectedProjection)) {
+                        SaveConfigBoolValue("ExperimentalCustomProjectionOverrideDetectedProjection",
+                                            g_config.experimentalCustomProjectionOverrideDetectedProjection);
+                    }
+                    if (ImGui::Checkbox("Override combined MVP-derived projection", &g_config.experimentalCustomProjectionOverrideCombinedMVP)) {
+                        SaveConfigBoolValue("ExperimentalCustomProjectionOverrideCombinedMVP",
+                                            g_config.experimentalCustomProjectionOverrideCombinedMVP);
+                    }
+
+                    if (g_config.experimentalCustomProjectionMode == 1) {
+                        float rows[4][4] = {
+                            { g_config.experimentalCustomProjectionManualMatrix._11, g_config.experimentalCustomProjectionManualMatrix._12, g_config.experimentalCustomProjectionManualMatrix._13, g_config.experimentalCustomProjectionManualMatrix._14 },
+                            { g_config.experimentalCustomProjectionManualMatrix._21, g_config.experimentalCustomProjectionManualMatrix._22, g_config.experimentalCustomProjectionManualMatrix._23, g_config.experimentalCustomProjectionManualMatrix._24 },
+                            { g_config.experimentalCustomProjectionManualMatrix._31, g_config.experimentalCustomProjectionManualMatrix._32, g_config.experimentalCustomProjectionManualMatrix._33, g_config.experimentalCustomProjectionManualMatrix._34 },
+                            { g_config.experimentalCustomProjectionManualMatrix._41, g_config.experimentalCustomProjectionManualMatrix._42, g_config.experimentalCustomProjectionManualMatrix._43, g_config.experimentalCustomProjectionManualMatrix._44 }
+                        };
+                        bool edited = false;
+                        edited |= ImGui::InputFloat4("ExpProj row1", rows[0], "%.6f");
+                        edited |= ImGui::InputFloat4("ExpProj row2", rows[1], "%.6f");
+                        edited |= ImGui::InputFloat4("ExpProj row3", rows[2], "%.6f");
+                        edited |= ImGui::InputFloat4("ExpProj row4", rows[3], "%.6f");
+                        if (edited) {
+                            g_config.experimentalCustomProjectionManualMatrix._11 = rows[0][0]; g_config.experimentalCustomProjectionManualMatrix._12 = rows[0][1]; g_config.experimentalCustomProjectionManualMatrix._13 = rows[0][2]; g_config.experimentalCustomProjectionManualMatrix._14 = rows[0][3];
+                            g_config.experimentalCustomProjectionManualMatrix._21 = rows[1][0]; g_config.experimentalCustomProjectionManualMatrix._22 = rows[1][1]; g_config.experimentalCustomProjectionManualMatrix._23 = rows[1][2]; g_config.experimentalCustomProjectionManualMatrix._24 = rows[1][3];
+                            g_config.experimentalCustomProjectionManualMatrix._31 = rows[2][0]; g_config.experimentalCustomProjectionManualMatrix._32 = rows[2][1]; g_config.experimentalCustomProjectionManualMatrix._33 = rows[2][2]; g_config.experimentalCustomProjectionManualMatrix._34 = rows[2][3];
+                            g_config.experimentalCustomProjectionManualMatrix._41 = rows[3][0]; g_config.experimentalCustomProjectionManualMatrix._42 = rows[3][1]; g_config.experimentalCustomProjectionManualMatrix._43 = rows[3][2]; g_config.experimentalCustomProjectionManualMatrix._44 = rows[3][3];
+                            const float* values = reinterpret_cast<const float*>(&g_config.experimentalCustomProjectionManualMatrix);
+                            for (int i = 0; i < 16; ++i) {
+                                int row = (i / 4) + 1;
+                                int col = (i % 4) + 1;
+                                char key[64] = {};
+                                snprintf(key, sizeof(key), "ExperimentalCustomProjectionM%d%d", row, col);
+                                SaveConfigFloatValue(key, values[i]);
+                            }
+                        }
+                    } else {
+                        if (ImGui::SliderFloat("Auto FOV (deg)", &g_config.experimentalCustomProjectionAutoFovDeg, 1.0f, 179.0f, "%.2f")) {
+                            SaveConfigFloatValue("ExperimentalCustomProjectionAutoFovDeg", g_config.experimentalCustomProjectionAutoFovDeg);
+                        }
+                        if (ImGui::InputFloat("Auto Near Z", &g_config.experimentalCustomProjectionAutoNearZ, 0.01f, 0.1f, "%.6f")) {
+                            SaveConfigFloatValue("ExperimentalCustomProjectionAutoNearZ", g_config.experimentalCustomProjectionAutoNearZ);
+                        }
+                        if (ImGui::InputFloat("Auto Far Z", &g_config.experimentalCustomProjectionAutoFarZ, 1.0f, 10.0f, "%.3f")) {
+                            SaveConfigFloatValue("ExperimentalCustomProjectionAutoFarZ", g_config.experimentalCustomProjectionAutoFarZ);
+                        }
+                        if (ImGui::InputFloat("Aspect fallback", &g_config.experimentalCustomProjectionAutoAspectFallback, 0.01f, 0.1f, "%.6f")) {
+                            SaveConfigFloatValue("ExperimentalCustomProjectionAutoAspectFallback", g_config.experimentalCustomProjectionAutoAspectFallback);
+                        }
+                        int handednessIndex = g_config.experimentalCustomProjectionAutoHandedness == ProjectionHandedness_Right ? 1 : 0;
+                        if (ImGui::RadioButton("Left-handed", handednessIndex == 0)) {
+                            g_config.experimentalCustomProjectionAutoHandedness = ProjectionHandedness_Left;
+                            SaveConfigRegisterValue("ExperimentalCustomProjectionAutoHandedness", g_config.experimentalCustomProjectionAutoHandedness);
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::RadioButton("Right-handed", handednessIndex == 1)) {
+                            g_config.experimentalCustomProjectionAutoHandedness = ProjectionHandedness_Right;
+                            SaveConfigRegisterValue("ExperimentalCustomProjectionAutoHandedness", g_config.experimentalCustomProjectionAutoHandedness);
+                        }
+                    }
+
+                    if (g_customProjectionStatus[0] != '\0') {
+                        ImGui::TextWrapped("%s", g_customProjectionStatus);
+                    }
+                }
+            }
+
             ImGui::Separator();
             DrawMatrixWithTranspose("MVP", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP,
                                     g_showTransposedMatrices);
@@ -2397,6 +2506,108 @@ static void CreateProjectionMatrixWithHandedness(D3DMATRIX* out,
     }
 }
 
+static bool TryGetCurrentDisplayAspect(IDirect3DDevice9* device,
+                                       HWND hwnd,
+                                       float* outAspect,
+                                       UINT* outWidth,
+                                       UINT* outHeight) {
+    if (!outAspect) {
+        return false;
+    }
+
+    if (device) {
+        D3DVIEWPORT9 viewport = {};
+        if (SUCCEEDED(device->GetViewport(&viewport)) && viewport.Width > 0 && viewport.Height > 0) {
+            *outAspect = static_cast<float>(viewport.Width) / static_cast<float>(viewport.Height);
+            if (outWidth) {
+                *outWidth = viewport.Width;
+            }
+            if (outHeight) {
+                *outHeight = viewport.Height;
+            }
+            return true;
+        }
+    }
+
+    RECT rc = {};
+    if (hwnd && GetClientRect(hwnd, &rc)) {
+        const LONG width = rc.right - rc.left;
+        const LONG height = rc.bottom - rc.top;
+        if (width > 0 && height > 0) {
+            *outAspect = static_cast<float>(width) / static_cast<float>(height);
+            if (outWidth) {
+                *outWidth = static_cast<UINT>(width);
+            }
+            if (outHeight) {
+                *outHeight = static_cast<UINT>(height);
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool BuildExperimentalCustomProjectionMatrix(IDirect3DDevice9* device,
+                                                    HWND hwnd,
+                                                    D3DMATRIX* outProjection,
+                                                    bool* outUsedAuto,
+                                                    float* outResolvedAspect,
+                                                    UINT* outWidth,
+                                                    UINT* outHeight) {
+    if (!outProjection || !g_config.experimentalCustomProjectionEnabled) {
+        return false;
+    }
+
+    const int mode = g_config.experimentalCustomProjectionMode;
+    if (mode == 1) {
+        *outProjection = g_config.experimentalCustomProjectionManualMatrix;
+        if (outUsedAuto) {
+            *outUsedAuto = false;
+        }
+        return true;
+    }
+
+    if (mode != 2) {
+        return false;
+    }
+
+    float aspect = g_config.experimentalCustomProjectionAutoAspectFallback;
+    UINT width = 0;
+    UINT height = 0;
+    TryGetCurrentDisplayAspect(device, hwnd, &aspect, &width, &height);
+
+    const float safeAspect = (std::max)(0.1f, aspect);
+    const float fovDeg = (std::max)(1.0f, (std::min)(g_config.experimentalCustomProjectionAutoFovDeg, 179.0f));
+    const float nearZ = (std::max)(0.0001f, g_config.experimentalCustomProjectionAutoNearZ);
+    const float farZ = (std::max)(nearZ + 0.001f, g_config.experimentalCustomProjectionAutoFarZ);
+    const ProjectionHandedness handedness =
+        g_config.experimentalCustomProjectionAutoHandedness == ProjectionHandedness_Right
+            ? ProjectionHandedness_Right
+            : ProjectionHandedness_Left;
+
+    CreateProjectionMatrixWithHandedness(outProjection,
+                                         fovDeg * (3.14159265f / 180.0f),
+                                         safeAspect,
+                                         nearZ,
+                                         farZ,
+                                         handedness);
+
+    if (outUsedAuto) {
+        *outUsedAuto = true;
+    }
+    if (outResolvedAspect) {
+        *outResolvedAspect = safeAspect;
+    }
+    if (outWidth) {
+        *outWidth = width;
+    }
+    if (outHeight) {
+        *outHeight = height;
+    }
+    return true;
+}
+
 static void OrthonormalizeViewMatrix(D3DMATRIX* view) {
     if (!view) {
         return;
@@ -2630,6 +2841,47 @@ public:
             m_real->SetTransform(D3DTS_VIEW, &m_currentView);
             m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
             return;
+        }
+
+        bool shouldApplyCustomProjection = false;
+        if (g_config.experimentalCustomProjectionEnabled) {
+            const bool projectionMissing = !m_hasProj;
+            const bool projectionOverrideAllowed = g_config.experimentalCustomProjectionOverrideDetectedProjection;
+            const bool mvpBlocksProjection = g_cameraMatrices.hasMVP && !g_config.experimentalCustomProjectionOverrideCombinedMVP;
+            shouldApplyCustomProjection = (projectionMissing || projectionOverrideAllowed) && !mvpBlocksProjection;
+        }
+
+        if (shouldApplyCustomProjection) {
+            D3DMATRIX customProjection = {};
+            bool usedAuto = false;
+            float resolvedAspect = 0.0f;
+            UINT width = 0;
+            UINT height = 0;
+            if (BuildExperimentalCustomProjectionMatrix(m_real, m_hwnd, &customProjection,
+                                                        &usedAuto, &resolvedAspect,
+                                                        &width, &height)) {
+                m_currentProj = customProjection;
+                m_hasProj = true;
+                g_projectionDetectedByNumericStructure = false;
+                g_projectionDetectedRegister = -1;
+                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                g_projectionDetectedFovRadians = ExtractFOV(customProjection);
+                StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
+                                      usedAuto
+                                          ? "experimental custom projection auto"
+                                          : "experimental custom projection manual");
+                if (usedAuto) {
+                    snprintf(g_customProjectionStatus, sizeof(g_customProjectionStatus),
+                             "Experimental projection active (auto): %ux%u aspect=%.4f fov=%.2f near=%.4f far=%.2f.",
+                             width, height, resolvedAspect,
+                             g_config.experimentalCustomProjectionAutoFovDeg,
+                             g_config.experimentalCustomProjectionAutoNearZ,
+                             g_config.experimentalCustomProjectionAutoFarZ);
+                } else {
+                    snprintf(g_customProjectionStatus, sizeof(g_customProjectionStatus),
+                             "Experimental projection active (manual matrix mode).");
+                }
+            }
         }
 
         D3DMATRIX identity = {};
@@ -3673,6 +3925,47 @@ void LoadConfig() {
     g_config.combinedMVPForceDecomposition = GetPrivateProfileIntA("CameraProxy", "CombinedMVPForceDecomposition", 0, path) != 0;
     g_config.combinedMVPLogDecomposition = GetPrivateProfileIntA("CameraProxy", "CombinedMVPLogDecomposition", 0, path) != 0;
 
+    g_config.experimentalCustomProjectionEnabled =
+        GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionEnabled", 0, path) != 0;
+    g_config.experimentalCustomProjectionMode =
+        GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionMode", 2, path);
+    g_config.experimentalCustomProjectionOverrideDetectedProjection =
+        GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideDetectedProjection", 0, path) != 0;
+    g_config.experimentalCustomProjectionOverrideCombinedMVP =
+        GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideCombinedMVP", 0, path) != 0;
+
+    char customBuf[64] = {};
+    GetPrivateProfileStringA("CameraProxy", "ExperimentalCustomProjectionAutoFovDeg", "60.0", customBuf, sizeof(customBuf), path);
+    g_config.experimentalCustomProjectionAutoFovDeg = (float)atof(customBuf);
+    GetPrivateProfileStringA("CameraProxy", "ExperimentalCustomProjectionAutoNearZ", "0.1", customBuf, sizeof(customBuf), path);
+    g_config.experimentalCustomProjectionAutoNearZ = (float)atof(customBuf);
+    GetPrivateProfileStringA("CameraProxy", "ExperimentalCustomProjectionAutoFarZ", "1000.0", customBuf, sizeof(customBuf), path);
+    g_config.experimentalCustomProjectionAutoFarZ = (float)atof(customBuf);
+    GetPrivateProfileStringA("CameraProxy", "ExperimentalCustomProjectionAutoAspectFallback", "1.7777778", customBuf, sizeof(customBuf), path);
+    g_config.experimentalCustomProjectionAutoAspectFallback = (float)atof(customBuf);
+    g_config.experimentalCustomProjectionAutoHandedness =
+        GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionAutoHandedness", ProjectionHandedness_Left, path);
+
+    D3DMATRIX defaultManualProjection = {};
+    CreateProjectionMatrixWithHandedness(&defaultManualProjection,
+                                         60.0f * (3.14159265f / 180.0f),
+                                         16.0f / 9.0f,
+                                         0.1f,
+                                         1000.0f,
+                                         ProjectionHandedness_Left);
+    g_config.experimentalCustomProjectionManualMatrix = defaultManualProjection;
+    float* manualValues = reinterpret_cast<float*>(&g_config.experimentalCustomProjectionManualMatrix);
+    const float* defaultManualValues = reinterpret_cast<const float*>(&defaultManualProjection);
+    for (int i = 0; i < 16; ++i) {
+        int row = (i / 4) + 1;
+        int col = (i % 4) + 1;
+        char key[64] = {};
+        snprintf(key, sizeof(key), "ExperimentalCustomProjectionM%d%d", row, col);
+        snprintf(customBuf, sizeof(customBuf), "%.7g", defaultManualValues[i]);
+        GetPrivateProfileStringA("CameraProxy", key, customBuf, customBuf, sizeof(customBuf), path);
+        manualValues[i] = (float)atof(customBuf);
+    }
+
     char buf[64];
     GetPrivateProfileStringA("CameraProxy", "MinFOV", "0.1", buf, sizeof(buf), path);
     g_config.minFOV = (float)atof(buf);
@@ -3713,6 +4006,20 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             LogMsg("Combined MVP assume identity world: %s", g_config.combinedMVPAssumeIdentityWorld ? "yes" : "no");
             LogMsg("Combined MVP force decomposition: %s", g_config.combinedMVPForceDecomposition ? "yes" : "no");
             LogMsg("Combined MVP log decomposition: %s", g_config.combinedMVPLogDecomposition ? "yes" : "no");
+            LogMsg("Experimental custom projection: %s", g_config.experimentalCustomProjectionEnabled ? "ENABLED" : "disabled");
+            LogMsg("Experimental custom projection mode: %s",
+                   g_config.experimentalCustomProjectionMode == 1 ? "manual" :
+                   (g_config.experimentalCustomProjectionMode == 2 ? "auto" : "invalid"));
+            LogMsg("Experimental custom projection overrides detected projection: %s",
+                   g_config.experimentalCustomProjectionOverrideDetectedProjection ? "yes" : "no");
+            LogMsg("Experimental custom projection overrides combined MVP: %s",
+                   g_config.experimentalCustomProjectionOverrideCombinedMVP ? "yes" : "no");
+            LogMsg("Experimental custom projection auto params: fov=%.2f near=%.5f far=%.2f aspectFallback=%.5f handedness=%s",
+                   g_config.experimentalCustomProjectionAutoFovDeg,
+                   g_config.experimentalCustomProjectionAutoNearZ,
+                   g_config.experimentalCustomProjectionAutoFarZ,
+                   g_config.experimentalCustomProjectionAutoAspectFallback,
+                   ProjectionHandednessLabel(static_cast<ProjectionHandedness>(g_config.experimentalCustomProjectionAutoHandedness)));
             LogMsg("Game profile: %s", GameProfileLabel(g_activeGameProfile));
             if (g_activeGameProfile == GameProfile_Barnyard2006) {
                 LogMsg("Barnyard layout: proj=c%d-c%d, viewWorld=c%d-c%d, modelViews=c%d..c%d (%d matrices)",
