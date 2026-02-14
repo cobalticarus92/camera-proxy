@@ -166,10 +166,14 @@ struct CameraMatrices {
     D3DMATRIX projection;
     D3DMATRIX world;
     D3DMATRIX mvp;
+    D3DMATRIX vp;
+    D3DMATRIX wv;
     bool hasView;
     bool hasProjection;
     bool hasWorld;
     bool hasMVP;
+    bool hasVP;
+    bool hasWV;
 };
 
 enum MatrixSlot {
@@ -177,7 +181,9 @@ enum MatrixSlot {
     MatrixSlot_View = 1,
     MatrixSlot_Projection = 2,
     MatrixSlot_MVP = 3,
-    MatrixSlot_Count = 4
+    MatrixSlot_VP = 4,
+    MatrixSlot_WV = 5,
+    MatrixSlot_Count = 6
 };
 
 
@@ -221,7 +227,6 @@ static WNDPROC g_imguiPrevWndProc = nullptr;
 static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
 static bool g_showAllConstantRegisters = false;
-static int g_allConstantStageFilter = 0;
 static bool g_showFpsStats = false;
 static bool g_showTransposedMatrices = false;
 static float g_imguiScaleRuntime = 1.0f;
@@ -305,11 +310,6 @@ enum ConstantUploadStage {
     ConstantUploadStage_Pixel = 1
 };
 
-enum ConstantUploadStageFilter {
-    ConstantUploadStageFilter_All = 0,
-    ConstantUploadStageFilter_Vertex = 1,
-    ConstantUploadStageFilter_Pixel = 2
-};
 
 struct ConstantUploadEvent {
     ConstantUploadStage stage = ConstantUploadStage_Vertex;
@@ -318,6 +318,14 @@ struct ConstantUploadEvent {
     UINT startRegister = 0;
     UINT vectorCount = 0;
     unsigned long long changeSerial = 0;
+};
+
+struct GlobalVertexRegisterState {
+    float value[4] = {};
+    bool valid = false;
+    unsigned long long lastUploadSerial = 0;
+    uintptr_t lastShaderKey = 0;
+    uint32_t lastShaderHash = 0;
 };
 
 static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMissing);
@@ -329,6 +337,7 @@ static unsigned long long g_constantChangeSerial = 0;
 static unsigned long long g_constantUploadSerial = 0;
 static std::deque<ConstantUploadEvent> g_constantUploadEvents = {};
 static constexpr size_t kMaxConstantUploadEvents = 2000;
+static GlobalVertexRegisterState g_allVertexRegisters[kMaxConstantRegisters] = {};
 static HANDLE g_memoryScannerThread = nullptr;
 static DWORD g_memoryScannerThreadId = 0;
 static DWORD g_memoryScannerLastTick = 0;
@@ -437,6 +446,35 @@ static void StoreMVPMatrix(const D3DMATRIX& mvp,
     g_cameraMatrices.mvp = mvp;
     g_cameraMatrices.hasMVP = true;
     UpdateMatrixSource(MatrixSlot_MVP, shaderKey, baseRegister, rows, transposed, manual,
+                       sourceLabel, extractedFromRegister);
+}
+
+
+static void StoreVPMatrix(const D3DMATRIX& vp,
+                          uintptr_t shaderKey = 0,
+                          int baseRegister = -1,
+                          int rows = 4,
+                          bool transposed = false,
+                          bool manual = false,
+                          const char* sourceLabel = nullptr,
+                          int extractedFromRegister = -1) {
+    g_cameraMatrices.vp = vp;
+    g_cameraMatrices.hasVP = true;
+    UpdateMatrixSource(MatrixSlot_VP, shaderKey, baseRegister, rows, transposed, manual,
+                       sourceLabel, extractedFromRegister);
+}
+
+static void StoreWVMatrix(const D3DMATRIX& wv,
+                          uintptr_t shaderKey = 0,
+                          int baseRegister = -1,
+                          int rows = 4,
+                          bool transposed = false,
+                          bool manual = false,
+                          const char* sourceLabel = nullptr,
+                          int extractedFromRegister = -1) {
+    g_cameraMatrices.wv = wv;
+    g_cameraMatrices.hasWV = true;
+    UpdateMatrixSource(MatrixSlot_WV, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
 
@@ -618,9 +656,6 @@ static uint32_t GetShaderHashForKey(uintptr_t shaderKey) {
     return HashBytesFNV1a(reinterpret_cast<const uint8_t*>(&shaderKey), sizeof(shaderKey));
 }
 
-static const char* ConstantUploadStageLabel(ConstantUploadStage stage) {
-    return stage == ConstantUploadStage_Pixel ? "PS" : "VS";
-}
 
 static void RecordConstantUpload(ConstantUploadStage stage,
                                  uintptr_t shaderKey,
@@ -782,6 +817,8 @@ static const char* MatrixSlotLabel(MatrixSlot slot) {
         case MatrixSlot_View: return "VIEW";
         case MatrixSlot_Projection: return "PROJECTION";
         case MatrixSlot_MVP: return "MVP";
+        case MatrixSlot_VP: return "VP";
+        case MatrixSlot_WV: return "WV";
         default: return "UNKNOWN";
     }
 }
@@ -915,6 +952,10 @@ static void TryAssignManualMatrixFromSelection(MatrixSlot slot,
         StoreProjectionMatrix(mat, shaderKey, baseRegister, rows, false, true);
     } else if (slot == MatrixSlot_MVP) {
         StoreMVPMatrix(mat, shaderKey, baseRegister, rows, false, true);
+    } else if (slot == MatrixSlot_VP) {
+        StoreVPMatrix(mat, shaderKey, baseRegister, rows, false, true);
+    } else if (slot == MatrixSlot_WV) {
+        StoreWVMatrix(mat, shaderKey, baseRegister, rows, false, true);
     }
 
     snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
@@ -1392,6 +1433,49 @@ static bool TryBuildMatrixSnapshotInfo(const ShaderConstantState& state, int bas
     return true;
 }
 
+static bool TryBuildMatrixFromGlobalRegisters(int baseRegister,
+                                              int rows,
+                                              bool transposed,
+                                              D3DMATRIX* outMatrix) {
+    if (!outMatrix || baseRegister < 0 || rows < 3 || rows > 4 ||
+        baseRegister + rows - 1 >= kMaxConstantRegisters) {
+        return false;
+    }
+
+    float m[16] = {};
+    for (int i = 0; i < rows; i++) {
+        const GlobalVertexRegisterState& globalState = g_allVertexRegisters[baseRegister + i];
+        if (!globalState.valid) {
+            return false;
+        }
+        memcpy(&m[i * 4], globalState.value, sizeof(globalState.value));
+    }
+
+    D3DMATRIX out = {};
+    if (!transposed) {
+        out._11 = m[0]; out._12 = m[1]; out._13 = m[2]; out._14 = m[3];
+        out._21 = m[4]; out._22 = m[5]; out._23 = m[6]; out._24 = m[7];
+        out._31 = m[8]; out._32 = m[9]; out._33 = m[10]; out._34 = m[11];
+        if (rows == 4) {
+            out._41 = m[12]; out._42 = m[13]; out._43 = m[14]; out._44 = m[15];
+        } else {
+            out._41 = 0.0f; out._42 = 0.0f; out._43 = 0.0f; out._44 = 1.0f;
+        }
+    } else {
+        out._11 = m[0]; out._21 = m[1]; out._31 = m[2]; out._41 = m[3];
+        out._12 = m[4]; out._22 = m[5]; out._32 = m[6]; out._42 = m[7];
+        out._13 = m[8]; out._23 = m[9]; out._33 = m[10]; out._43 = m[11];
+        if (rows == 4) {
+            out._14 = m[12]; out._24 = m[13]; out._34 = m[14]; out._44 = m[15];
+        } else {
+            out._14 = 0.0f; out._24 = 0.0f; out._34 = 0.0f; out._44 = 1.0f;
+        }
+    }
+
+    *outMatrix = out;
+    return true;
+}
+
 static void ScanBuffer(const void* base, size_t size, int& resultsFound) {
     if (!base || size < sizeof(D3DMATRIX)) {
         return;
@@ -1799,6 +1883,12 @@ static void RenderImGuiOverlay() {
             DrawMatrixWithTranspose("MVP", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP,
                                     g_showTransposedMatrices);
             DrawMatrixSourceInfo(MatrixSlot_MVP, g_cameraMatrices.hasMVP);
+            DrawMatrixWithTranspose("VP", g_cameraMatrices.vp, g_cameraMatrices.hasVP,
+                                    g_showTransposedMatrices);
+            DrawMatrixSourceInfo(MatrixSlot_VP, g_cameraMatrices.hasVP);
+            DrawMatrixWithTranspose("WV", g_cameraMatrices.wv, g_cameraMatrices.hasWV,
+                                    g_showTransposedMatrices);
+            DrawMatrixSourceInfo(MatrixSlot_WV, g_cameraMatrices.hasWV);
 
             if (ImGui::CollapsingHeader("Combined MVP handling", ImGuiTreeNodeFlags_DefaultOpen)) {
                 if (ImGui::Checkbox("Enable Combined MVP", &g_config.enableCombinedMVP)) {
@@ -1904,12 +1994,7 @@ static void RenderImGuiOverlay() {
                 ImGui::Text("<no shader constants captured yet>");
             }
 
-            ImGui::Checkbox("Show all constant uploads (VS/PS, all shaders)", &g_showAllConstantRegisters);
-            ImGui::SameLine();
-            if (ImGui::Button("Clear upload history")) {
-                std::lock_guard<std::mutex> lock(g_uiDataMutex);
-                g_constantUploadEvents.clear();
-            }
+            ImGui::Checkbox("View all VS constant registers (all shaders)", &g_showAllConstantRegisters);
 
             ImGui::Checkbox("Group by 4-register matrices", &g_showConstantsAsMatrices);
             ImGui::SameLine();
@@ -1972,90 +2057,124 @@ static void RenderImGuiOverlay() {
             ImGui::BeginChild("ConstantsScroll", ImVec2(0, 270), true);
             ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
             if (g_showAllConstantRegisters) {
-                static const char* kStageFilters[] = {"All", "Vertex (VS)", "Pixel (PS)"};
-                ImGui::SetNextItemWidth(190.0f);
-                ImGui::Combo("Stage filter", &g_allConstantStageFilter, kStageFilters, IM_ARRAYSIZE(kStageFilters));
-
-                std::vector<ConstantUploadEvent> events;
-                {
-                    std::lock_guard<std::mutex> lock(g_uiDataMutex);
-                    events.assign(g_constantUploadEvents.begin(), g_constantUploadEvents.end());
-                }
-
-                struct RegisterAggregate {
-                    bool seen = false;
-                    unsigned int touches = 0;
-                    unsigned long long lastSerial = 0;
-                    ConstantUploadStage lastStage = ConstantUploadStage_Vertex;
-                    UINT lastStartRegister = 0;
-                    UINT lastVectorCount = 0;
-                    uintptr_t lastShaderKey = 0;
-                    uint32_t lastShaderHash = 0;
-                };
-
-                RegisterAggregate aggregates[kMaxConstantRegisters] = {};
-                for (const ConstantUploadEvent& ev : events) {
-                    if (g_allConstantStageFilter == ConstantUploadStageFilter_Vertex &&
-                        ev.stage != ConstantUploadStage_Vertex) {
-                        continue;
-                    }
-                    if (g_allConstantStageFilter == ConstantUploadStageFilter_Pixel &&
-                        ev.stage != ConstantUploadStage_Pixel) {
-                        continue;
-                    }
-
-                    const UINT uploadEndExclusive = (ev.vectorCount == 0)
-                        ? (ev.startRegister + 1)
-                        : (ev.startRegister + ev.vectorCount);
-                    for (UINT reg = ev.startRegister;
-                         reg < uploadEndExclusive && reg < static_cast<UINT>(kMaxConstantRegisters);
-                         ++reg) {
-                        RegisterAggregate& agg = aggregates[reg];
-                        agg.seen = true;
-                        agg.touches++;
-                        if (ev.changeSerial >= agg.lastSerial) {
-                            agg.lastSerial = ev.changeSerial;
-                            agg.lastStage = ev.stage;
-                            agg.lastStartRegister = ev.startRegister;
-                            agg.lastVectorCount = ev.vectorCount;
-                            agg.lastShaderKey = ev.shaderKey;
-                            agg.lastShaderHash = ev.shaderHash;
-                        }
-                    }
-                }
-
                 bool anyShown = false;
-                ImGui::Text("All constant registers (ascending):");
-                for (int reg = 0; reg < kMaxConstantRegisters; ++reg) {
-                    const RegisterAggregate& agg = aggregates[reg];
-                    if (!agg.seen) {
-                        continue;
-                    }
-                    anyShown = true;
-                    const UINT endRegister = agg.lastVectorCount > 0
-                        ? (agg.lastStartRegister + agg.lastVectorCount - 1)
-                        : agg.lastStartRegister;
-                    char itemLabel[320] = {};
-                    snprintf(itemLabel, sizeof(itemLabel),
-                             "c%d | hits:%u | last:%s c%u-c%u (%u vectors) | shader 0x%p | hash 0x%08X###all_reg_%d",
-                             reg,
-                             agg.touches,
-                             ConstantUploadStageLabel(agg.lastStage),
-                             agg.lastStartRegister,
-                             endRegister,
-                             agg.lastVectorCount,
-                             reinterpret_cast<void*>(agg.lastShaderKey),
-                             agg.lastShaderHash,
-                             reg);
-                    if (ImGui::Selectable(itemLabel, g_selectedRegister == reg)) {
-                        if (agg.lastShaderKey != 0) {
-                            g_selectedShaderKey = agg.lastShaderKey;
+                ImGui::Text("All vertex shader constant registers (all shaders):");
+                if (g_showConstantsAsMatrices) {
+                    for (int base = 0; base < kMaxConstantRegisters; base += 4) {
+                        bool anyValid = false;
+                        for (int reg = base; reg < base + 4; reg++) {
+                            if (g_allVertexRegisters[reg].valid) {
+                                anyValid = true;
+                                break;
+                            }
                         }
-                        g_selectedRegister = reg;
+                        if (!anyValid) {
+                            continue;
+                        }
+
+                        D3DMATRIX mat = {};
+                        bool hasMatrix = TryBuildMatrixFromGlobalRegisters(base, 4, false, &mat);
+                        bool looksLike = hasMatrix && LooksLikeMatrix(reinterpret_cast<const float*>(&mat));
+                        if (g_filterDetectedMatrices && (!hasMatrix || !looksLike)) {
+                            continue;
+                        }
+                        anyShown = true;
+
+                        char label[64] = {};
+                        snprintf(label, sizeof(label), "c%d-c%d%s", base, base + 3,
+                                 looksLike ? " (matrix)" : "");
+                        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
+                                                   ImGuiTreeNodeFlags_SpanAvailWidth;
+                        if (g_selectedRegister == base) {
+                            flags |= ImGuiTreeNodeFlags_Selected;
+                        }
+                        bool open = ImGui::TreeNodeEx(label, flags);
+                        if (ImGui::IsItemClicked()) {
+                            g_selectedRegister = base;
+                        }
+                        if (open) {
+                            for (int reg = base; reg < base + 4; reg++) {
+                                char rowLabel[192] = {};
+                                const GlobalVertexRegisterState& globalState = g_allVertexRegisters[reg];
+                                if (globalState.valid) {
+                                    snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]###all_reg_%d",
+                                             reg,
+                                             globalState.value[0], globalState.value[1],
+                                             globalState.value[2], globalState.value[3],
+                                             reg);
+                                } else {
+                                    snprintf(rowLabel, sizeof(rowLabel), "c%d: <unset>###all_reg_%d", reg, reg);
+                                }
+                                if (ImGui::Selectable(rowLabel, g_selectedRegister == reg)) {
+                                    if (globalState.lastShaderKey != 0) {
+                                        g_selectedShaderKey = globalState.lastShaderKey;
+                                    }
+                                    g_selectedRegister = reg;
+                                }
+                            }
+
+                            int selectedRows = g_manualAssignRows;
+                            bool canAssign = (selectedRows == 4)
+                                ? TryBuildMatrixFromGlobalRegisters(base, 4, false, &mat)
+                                : TryBuildMatrixFromGlobalRegisters(base, 3, false, &mat);
+                            if (canAssign) {
+                                uintptr_t sourceShaderKey = g_allVertexRegisters[base].lastShaderKey;
+                                ImGui::PushID(base + 5000);
+                                if (ImGui::Button("Use as World")) {
+                                    TryAssignManualMatrixFromSelection(MatrixSlot_World, sourceShaderKey,
+                                                                       base, selectedRows, mat);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Use as View")) {
+                                    TryAssignManualMatrixFromSelection(MatrixSlot_View, sourceShaderKey,
+                                                                       base, selectedRows, mat);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Use as Projection")) {
+                                    TryAssignManualMatrixFromSelection(MatrixSlot_Projection, sourceShaderKey,
+                                                                       base, selectedRows, mat);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Use as MVP")) {
+                                    TryAssignManualMatrixFromSelection(MatrixSlot_MVP, sourceShaderKey,
+                                                                       base, selectedRows, mat);
+                                }
+                                if (ImGui::Button("Use as VP")) {
+                                    TryAssignManualMatrixFromSelection(MatrixSlot_VP, sourceShaderKey,
+                                                                       base, selectedRows, mat);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Use as WV")) {
+                                    TryAssignManualMatrixFromSelection(MatrixSlot_WV, sourceShaderKey,
+                                                                       base, selectedRows, mat);
+                                }
+                                ImGui::PopID();
+                            }
+                            ImGui::TreePop();
+                        }
+                    }
+                } else {
+                    for (int reg = 0; reg < kMaxConstantRegisters; ++reg) {
+                        const GlobalVertexRegisterState& globalState = g_allVertexRegisters[reg];
+                        if (!globalState.valid) {
+                            continue;
+                        }
+                        anyShown = true;
+                        char rowLabel[192] = {};
+                        snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]###all_reg_%d",
+                                 reg,
+                                 globalState.value[0], globalState.value[1], globalState.value[2], globalState.value[3],
+                                 reg);
+                        if (ImGui::Selectable(rowLabel, g_selectedRegister == reg)) {
+                            if (globalState.lastShaderKey != 0) {
+                                g_selectedShaderKey = globalState.lastShaderKey;
+                            }
+                            g_selectedRegister = reg;
+                        }
                     }
                 }
                 if (!anyShown) {
-                    ImGui::Text("<no constant uploads captured for current stage filter>");
+                    ImGui::Text("<no vertex shader constants captured yet>");
                 }
             } else if (state && state->snapshotReady) {
                 if (g_showConstantsAsMatrices) {
@@ -2152,6 +2271,15 @@ static void RenderImGuiOverlay() {
                                     ImGui::SameLine();
                                     if (ImGui::Button("Use as MVP")) {
                                         TryAssignManualMatrixFromSelection(MatrixSlot_MVP, g_selectedShaderKey,
+                                                                           base, selectedRows, assignedMat);
+                                    }
+                                    if (ImGui::Button("Use as VP")) {
+                                        TryAssignManualMatrixFromSelection(MatrixSlot_VP, g_selectedShaderKey,
+                                                                           base, selectedRows, assignedMat);
+                                    }
+                                    ImGui::SameLine();
+                                    if (ImGui::Button("Use as WV")) {
+                                        TryAssignManualMatrixFromSelection(MatrixSlot_WV, g_selectedShaderKey,
                                                                            base, selectedRows, assignedMat);
                                     }
                                     ImGui::PopID();
@@ -3103,6 +3231,13 @@ public:
             memcpy(state->constants[reg], effectiveConstantData + i * 4, sizeof(state->constants[reg]));
             state->valid[reg] = true;
             UpdateVariance(*state, static_cast<int>(reg), effectiveConstantData + i * 4);
+
+            GlobalVertexRegisterState& globalState = g_allVertexRegisters[reg];
+            memcpy(globalState.value, effectiveConstantData + i * 4, sizeof(globalState.value));
+            globalState.valid = true;
+            globalState.lastUploadSerial = g_constantUploadSerial;
+            globalState.lastShaderKey = shaderKey;
+            globalState.lastShaderHash = GetShaderHashForKey(shaderKey);
         }
         if (constantsChanged) {
             state->lastChangeSerial = ++g_constantChangeSerial;
@@ -3141,6 +3276,10 @@ public:
                     StoreProjectionMatrix(m_currentProj, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_MVP) {
                     StoreMVPMatrix(manualMat, shaderKey, binding.baseRegister, binding.rows, false, true);
+                } else if (slot == MatrixSlot_VP) {
+                    StoreVPMatrix(manualMat, shaderKey, binding.baseRegister, binding.rows, false, true);
+                } else if (slot == MatrixSlot_WV) {
+                    StoreWVMatrix(manualMat, shaderKey, binding.baseRegister, binding.rows, false, true);
                 }
             }
         }
