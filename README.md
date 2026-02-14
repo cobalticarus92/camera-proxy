@@ -47,20 +47,41 @@ If enabled (`ProbeTransposedLayouts=1`), a failing candidate is transposed once 
 - `>= 0` means only that base register is accepted for that type.
 - `-1` means classify from all observed constant ranges.
 
-### 5) Game profiles (Metal Gear Rising)
+### 5) Game profiles
 
-You can enable a fixed register profile via `camera_proxy.ini`:
+You can enable fixed-profile extraction via `camera_proxy.ini`:
 
 - `GameProfile=MetalGearRising`
+- `GameProfile=Barnyard2006`
 
-When active, the proxy prioritizes the known MGR:R layout:
+**Metal Gear Rising profile**
 
 - `c4-c7`   → Projection
 - `c12-c15` → View Inverse (inverted deterministically to derive View)
 - `c16-c19` → World
 - optional tracking only: `c8-c11` (ViewProjection), `c20-c23` (WorldView)
 
-For this profile path, matrix extraction avoids heuristic ranking for core W/V/P when expected registers are seen. If expected profile uploads are not matched or inverse-view inversion fails (non-invertible matrix), the proxy logs a warning/status and falls back to structural detection.
+If expected uploads are not matched or inverse-view inversion fails (non-invertible matrix), the proxy logs a warning/status and falls back to structural detection.
+
+**Barnyard 2006 profile (dedicated transform reconstruction)**
+
+Barnyard shaders use a combined path similar to:
+
+- `vertexViewSpace = modelViews[i] * position`
+- `gl_Position = u_Projection * vertexViewSpace`
+
+and also provide `u_ViewWorld` (camera→world, i.e. inverse View).
+
+Profile behavior:
+
+- Extract `u_Projection` from `BarnyardProjectionBase`.
+- Extract `u_ViewWorld` from `BarnyardViewWorldBase`, derive `View = inverse(u_ViewWorld)`.
+- Verify `View * u_ViewWorld ≈ I` and report consistency in overlay/log.
+- For each per-instance `modelViews[i]` upload (`BarnyardModelViewBase`, `BarnyardModelViewCount`), derive:
+  - `World = inverse(View) * modelViews[i]`
+- Emit fixed-function transforms per draw (`WORLD`, `VIEW`, `PROJECTION`) from these derived matrices.
+- While Barnyard profile is active, structural auto-detection is disabled to avoid misclassifying combined `modelViews` data.
+- Optional shader signature gating via `BarnyardShaderHash` ensures the profile only activates on expected shader bytecode.
 
 ### 6) Draw-time emission
 
