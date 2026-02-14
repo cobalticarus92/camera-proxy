@@ -3032,10 +3032,10 @@ public:
             if (tryExtractMgrMatrix(4, &mat)) {
                 g_profileCoreRegistersSeen[0] = true;
                 g_mgrProjectionRegisterValid = IsTypicalProjectionMatrix(mat);
+                m_currentProj = mat;
+                m_hasProj = true;
+                g_mgrProjCapturedThisFrame = true;
                 if (g_mgrProjectionRegisterValid) {
-                    m_currentProj = mat;
-                    m_hasProj = true;
-                    g_mgrProjCapturedThisFrame = true;
                     g_projectionDetectedByNumericStructure = false;
                     g_projectionDetectedRegister = 4;
                     g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
@@ -3043,10 +3043,14 @@ public:
                     StoreProjectionMatrix(m_currentProj, shaderKey, 4, 4, false, true,
                                           "MetalGearRising profile projection (c4-c7)");
                 } else {
-                    m_hasProj = false;
-                    g_mgrProjCapturedThisFrame = false;
+                    g_projectionDetectedByNumericStructure = false;
+                    g_projectionDetectedRegister = 4;
+                    g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                    g_projectionDetectedFovRadians = 0.0f;
+                    StoreProjectionMatrix(m_currentProj, shaderKey, 4, 4, false, true,
+                                          "MetalGearRising profile projection (c4-c7, non-typical)");
                     snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                             "MGR projection at c4-c7 rejected (non-typical projection values).");
+                             "MGR projection at c4-c7 is non-typical; using it by default.");
                 }
             }
 
@@ -3060,24 +3064,26 @@ public:
                 if (m_hasProj) {
                     resolvedProjection = m_currentProj;
                     haveProjectionForViewDerivation = true;
-                } else {
-                    if (m_mgrrUseAutoProjection) {
-                        ProjectionAnalysis generatedProjectionInfo = {};
-                        if (TryExtractProjectionFromCombined(mat,
-                                                             &generatedProjectionInfo,
-                                                             &resolvedProjection,
-                                                             g_config.combinedMVPForceDecomposition)) {
-                            m_currentProj = resolvedProjection;
-                            m_hasProj = true;
-                            g_mgrProjCapturedThisFrame = true;
-                            g_projectionDetectedByNumericStructure = true;
-                            g_projectionDetectedRegister = 8;
-                            g_projectionDetectedHandedness = generatedProjectionInfo.handedness;
-                            g_projectionDetectedFovRadians = generatedProjectionInfo.fovRadians;
-                            StoreProjectionMatrix(m_currentProj, shaderKey, 8, 4, false, true,
-                                                  "MetalGearRising auto projection from VP (c8-c11)");
-                            haveProjectionForViewDerivation = true;
-                        }
+                }
+
+                if (!g_mgrProjectionRegisterValid && m_mgrrUseAutoProjection) {
+                    ProjectionAnalysis generatedProjectionInfo = {};
+                    D3DMATRIX generatedProjection = {};
+                    if (TryExtractProjectionFromCombined(mat,
+                                                         &generatedProjectionInfo,
+                                                         &generatedProjection,
+                                                         g_config.combinedMVPForceDecomposition)) {
+                        resolvedProjection = generatedProjection;
+                        m_currentProj = generatedProjection;
+                        m_hasProj = true;
+                        g_mgrProjCapturedThisFrame = true;
+                        g_projectionDetectedByNumericStructure = true;
+                        g_projectionDetectedRegister = 8;
+                        g_projectionDetectedHandedness = generatedProjectionInfo.handedness;
+                        g_projectionDetectedFovRadians = generatedProjectionInfo.fovRadians;
+                        StoreProjectionMatrix(m_currentProj, shaderKey, 8, 4, false, true,
+                                              "MetalGearRising auto projection from VP (c8-c11)");
+                        haveProjectionForViewDerivation = true;
                     }
                 }
 
@@ -3102,7 +3108,7 @@ public:
                 } else {
                     g_profileViewDerivedFromInverse = false;
                     snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                             "MGR VP detected but no valid projection (c4 invalid). Enable auto projection to derive view.");
+                             "MGR VP detected but projection inversion failed. Enable auto projection to prefer generated projection.");
                 }
             }
 
