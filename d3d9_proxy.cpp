@@ -96,7 +96,8 @@ struct ProxyConfig {
 
 enum GameProfileKind {
     GameProfile_None = 0,
-    GameProfile_MetalGearRising
+    GameProfile_MetalGearRising,
+    GameProfile_Barnyard2006
 };
 
 struct RegisterLayoutProfile {
@@ -105,6 +106,8 @@ struct RegisterLayoutProfile {
     int worldBase = -1;
     int viewProjectionBase = -1;
     int worldViewBase = -1;
+    int modelViewBase = -1;
+    int modelViewCount = 1;
 };
 
 static GameProfileKind g_activeGameProfile = GameProfile_None;
@@ -113,6 +116,16 @@ static bool g_profileViewDerivedFromInverse = false;
 static bool g_profileCoreRegistersSeen[3] = { false, false, false }; // proj, viewInv, world
 static bool g_profileOptionalRegistersSeen[2] = { false, false }; // VP, WV
 static char g_profileStatusMessage[256] = "";
+static D3DMATRIX g_profileViewInverseMatrix = {};
+static D3DMATRIX g_profileDerivedWorldMatrix = {};
+static D3DMATRIX g_profileLastModelViewMatrix = {};
+static bool g_profileHasViewInverseMatrix = false;
+static bool g_profileHasDerivedWorldMatrix = false;
+static bool g_profileHasLastModelViewMatrix = false;
+static bool g_profileViewInverseConsistencyOk = false;
+static float g_profileViewInverseConsistencyError = std::numeric_limits<float>::max();
+static bool g_profileDisableStructuralDetection = false;
+static uint32_t g_barnyardShaderHash = 0;
 
 static ProxyConfig g_config;
 static HMODULE g_hD3D9 = nullptr;
@@ -1001,6 +1014,7 @@ static D3DMATRIX InvertSimpleRigidView(const D3DMATRIX& view) {
 
 static const char* GameProfileLabel(GameProfileKind profile) {
     switch (profile) {
+        case GameProfile_Barnyard2006: return "Barnyard2006";
         case GameProfile_MetalGearRising: return "MetalGearRising";
         case GameProfile_None:
         default:
@@ -1017,6 +1031,10 @@ static GameProfileKind ParseGameProfile(const char* profileName) {
         _stricmp(profileName, "MetalGearRisingRevengeance") == 0) {
         return GameProfile_MetalGearRising;
     }
+    if (_stricmp(profileName, "Barnyard2006") == 0 ||
+        _stricmp(profileName, "Barnyard") == 0) {
+        return GameProfile_Barnyard2006;
+    }
     return GameProfile_None;
 }
 
@@ -1028,6 +1046,15 @@ static void ConfigureActiveProfileLayout() {
         g_profileLayout.viewInverseBase = 12;
         g_profileLayout.worldBase = 16;
         g_profileLayout.worldViewBase = 20;
+    } else if (g_activeGameProfile == GameProfile_Barnyard2006) {
+        // Barnyard shader pipeline (worldshader.vs):
+        //   vertexViewSpace = modelViews[i] * position;
+        //   gl_Position = u_Projection * vertexViewSpace;
+        // with u_ViewWorld provided as View^-1 (camera->world).
+        g_profileLayout.projectionBase = 0;
+        g_profileLayout.viewInverseBase = 4;
+        g_profileLayout.modelViewBase = 16;
+        g_profileLayout.modelViewCount = 64;
     }
 }
 
@@ -2130,6 +2157,34 @@ static void RenderImGuiOverlay() {
                     ImGui::TextWrapped("%s", g_profileStatusMessage);
                 }
             }
+            else if (g_activeGameProfile == GameProfile_Barnyard2006) {
+                ImGui::Text("Barnyard layout: Projection=c%d-c%d, ViewWorldInverse=c%d-c%d, modelViews base=c%d",
+                            g_profileLayout.projectionBase, g_profileLayout.projectionBase + 3,
+                            g_profileLayout.viewInverseBase, g_profileLayout.viewInverseBase + 3,
+                            g_profileLayout.modelViewBase);
+                ImGui::Text("Core seen: Proj=%s ViewInv=%s DerivedWorld=%s",
+                            g_profileCoreRegistersSeen[0] ? "yes" : "no",
+                            g_profileCoreRegistersSeen[1] ? "yes" : "no",
+                            g_profileCoreRegistersSeen[2] ? "yes" : "no");
+                ImGui::Text("Structural detection: %s", g_profileDisableStructuralDetection ? "DISABLED (profile isolation)" : "enabled");
+                ImGui::Text("View consistency: %s (max |View*ViewInv-I| = %.6f)",
+                            g_profileViewInverseConsistencyOk ? "PASS" : "CHECK",
+                            g_profileViewInverseConsistencyError);
+                if (g_profileStatusMessage[0] != '\0') {
+                    ImGui::TextWrapped("%s", g_profileStatusMessage);
+                }
+                ImGui::Separator();
+                DrawMatrixWithTranspose("Barnyard u_Projection", g_cameraMatrices.projection, g_cameraMatrices.hasProjection,
+                                        g_showTransposedMatrices);
+                DrawMatrixWithTranspose("Barnyard u_ViewWorld (inverse view)", g_profileViewInverseMatrix, g_profileHasViewInverseMatrix,
+                                        g_showTransposedMatrices);
+                DrawMatrixWithTranspose("Barnyard View (derived)", g_cameraMatrices.view, g_cameraMatrices.hasView,
+                                        g_showTransposedMatrices);
+                DrawMatrixWithTranspose("Barnyard modelViews[i]", g_profileLastModelViewMatrix, g_profileHasLastModelViewMatrix,
+                                        g_showTransposedMatrices);
+                DrawMatrixWithTranspose("Barnyard World (derived per draw)", g_profileDerivedWorldMatrix, g_profileHasDerivedWorldMatrix,
+                                        g_showTransposedMatrices);
+            }
             ImGui::Separator();
             DrawMatrixWithTranspose("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld,
                                     g_showTransposedMatrices);
@@ -2872,6 +2927,22 @@ static bool IsIdentityMatrix(const D3DMATRIX& m, float tolerance) {
            fabsf(m._42) < tolerance &&
            fabsf(m._43) < tolerance;
 }
+static float MatrixIdentityMaxError(const D3DMATRIX& m) {
+    const D3DMATRIX identity = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    };
+    const float* a = reinterpret_cast<const float*>(&m);
+    const float* b = reinterpret_cast<const float*>(&identity);
+    float maxErr = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        maxErr = (std::max)(maxErr, fabsf(a[i] - b[i]));
+    }
+    return maxErr;
+}
+
 
 static bool MatrixClose(const D3DMATRIX& a, const D3DMATRIX& b, float tolerance) {
     const float* pa = reinterpret_cast<const float*>(&a);
@@ -3099,7 +3170,14 @@ public:
             }
         }
 
-        const bool profileActive = g_activeGameProfile == GameProfile_MetalGearRising;
+        const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
+        const bool profileIsBarnyardRequested = g_activeGameProfile == GameProfile_Barnyard2006;
+        uint32_t activeShaderHash = 0;
+        const bool hasActiveShaderHash = TryGetShaderBytecodeHash(shaderKey, &activeShaderHash);
+        const bool barnyardShaderMatch = !profileIsBarnyardRequested ? false :
+                                         (g_barnyardShaderHash == 0 || (hasActiveShaderHash && activeShaderHash == g_barnyardShaderHash));
+        const bool profileIsBarnyard = profileIsBarnyardRequested && barnyardShaderMatch;
+        const bool profileActive = profileIsMgr || profileIsBarnyard;
         bool profileHardFailure = false;
         bool profileMatchedKnownConstants = false;
 
@@ -3111,7 +3189,7 @@ public:
                                                     baseRegister, 4, false, outMat);
         };
 
-        if (profileActive) {
+        if (profileIsMgr) {
             D3DMATRIX mat = {};
             if (tryExtractProfileMatrix(g_profileLayout.projectionBase, &mat)) {
                 profileMatchedKnownConstants = true;
@@ -3143,7 +3221,6 @@ public:
                 float determinant = 0.0f;
                 D3DMATRIX derivedView = {};
                 if (InvertMatrix4x4Deterministic(mat, &derivedView, &determinant)) {
-                    assert(fabsf(determinant) > 1e-8f && "MGR viewInverse determinant should be non-zero");
                     m_currentView = derivedView;
                     m_hasView = true;
                     slotResolvedByOverride[MatrixSlot_View] = true;
@@ -3171,6 +3248,100 @@ public:
 
             if (tryExtractProfileMatrix(g_profileLayout.worldViewBase, &mat)) {
                 g_profileOptionalRegistersSeen[1] = true;
+            }
+        }
+
+        if (profileIsBarnyard) {
+            D3DMATRIX mat = {};
+            if (tryExtractProfileMatrix(g_profileLayout.projectionBase, &mat)) {
+                profileMatchedKnownConstants = true;
+                m_currentProj = mat;
+                m_hasProj = true;
+                slotResolvedByOverride[MatrixSlot_Projection] = true;
+                g_projectionDetectedByNumericStructure = false;
+                g_projectionDetectedRegister = g_profileLayout.projectionBase;
+                g_projectionDetectedHandedness = ProjectionHandedness_Left;
+                g_projectionDetectedFovRadians = ExtractFOV(mat);
+                g_profileCoreRegistersSeen[0] = true;
+                StoreProjectionMatrix(m_currentProj, shaderKey, g_profileLayout.projectionBase, 4, false, true,
+                                      "Barnyard profile u_Projection");
+            }
+
+            if (tryExtractProfileMatrix(g_profileLayout.viewInverseBase, &mat)) {
+                profileMatchedKnownConstants = true;
+                g_profileCoreRegistersSeen[1] = true;
+                g_profileViewInverseMatrix = mat;
+                g_profileHasViewInverseMatrix = true;
+                float determinant = 0.0f;
+                D3DMATRIX derivedView = {};
+                if (InvertMatrix4x4Deterministic(mat, &derivedView, &determinant)) {
+                    m_currentView = derivedView;
+                    m_hasView = true;
+                    slotResolvedByOverride[MatrixSlot_View] = true;
+                    g_profileViewDerivedFromInverse = true;
+                    D3DMATRIX consistency = MultiplyMatrix(m_currentView, g_profileViewInverseMatrix);
+                    g_profileViewInverseConsistencyError = MatrixIdentityMaxError(consistency);
+                    g_profileViewInverseConsistencyOk = g_profileViewInverseConsistencyError < 0.02f;
+                    if (!g_profileViewInverseConsistencyOk) {
+                        LogMsg("WARNING: Barnyard View*ViewInverse consistency error=%.6f (expected identity).", g_profileViewInverseConsistencyError);
+                    }
+                    StoreViewMatrix(m_currentView, shaderKey, g_profileLayout.viewInverseBase, 4, false, true,
+                                    "Barnyard profile View = inverse(u_ViewWorld)", g_profileLayout.viewInverseBase);
+                } else {
+                    profileHardFailure = true;
+                    g_profileViewDerivedFromInverse = false;
+                    g_profileViewInverseConsistencyOk = false;
+                    g_profileViewInverseConsistencyError = std::numeric_limits<float>::max();
+                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                             "WARNING: Barnyard profile failed to invert u_ViewWorld (det=%.9f).", determinant);
+                    LogMsg("WARNING: Barnyard profile failed to invert u_ViewWorld at c%d-c%d (det=%.9f).",
+                           g_profileLayout.viewInverseBase, g_profileLayout.viewInverseBase + 3, determinant);
+                }
+            }
+
+            if (effectiveConstantData && g_profileLayout.modelViewBase >= 0) {
+                const int modelViewSpan = (std::max)(1, g_profileLayout.modelViewCount) * 4;
+                const int uploadStart = static_cast<int>(StartRegister);
+                const int uploadEnd = static_cast<int>(StartRegister + Vector4fCount - 1);
+                const int modelViewEnd = g_profileLayout.modelViewBase + modelViewSpan - 1;
+                if (uploadStart <= modelViewEnd && uploadEnd >= g_profileLayout.modelViewBase) {
+                    for (int mvBase = g_profileLayout.modelViewBase; mvBase <= modelViewEnd; mvBase += 4) {
+                        D3DMATRIX modelView = {};
+                        if (!TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                              mvBase, 4, false, &modelView)) {
+                            continue;
+                        }
+                        profileMatchedKnownConstants = true;
+                        g_profileHasLastModelViewMatrix = true;
+                        g_profileLastModelViewMatrix = modelView;
+
+                        if (m_hasView) {
+                            D3DMATRIX viewInverse = {};
+                            float detView = 0.0f;
+                            if (InvertMatrix4x4Deterministic(m_currentView, &viewInverse, &detView)) {
+                                // Barnyard shader uses modelViews[i] = World * View. Recover World per draw:
+                                //   World = inverse(View) * ModelView.
+                                D3DMATRIX derivedWorld = MultiplyMatrix(viewInverse, modelView);
+                                m_currentWorld = derivedWorld;
+                                m_hasWorld = true;
+                                slotResolvedByOverride[MatrixSlot_World] = true;
+                                g_profileHasDerivedWorldMatrix = true;
+                                g_profileDerivedWorldMatrix = derivedWorld;
+                                g_profileCoreRegistersSeen[2] = true;
+                                StoreWorldMatrix(m_currentWorld, shaderKey, mvBase, 4, false, true,
+                                                 "Barnyard profile World = inverse(View) * modelViews[i]", mvBase);
+                            } else {
+                                profileHardFailure = true;
+                                LogMsg("WARNING: Barnyard profile could not invert derived View while reconstructing World.");
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!profileHardFailure && profileMatchedKnownConstants) {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "Barnyard profile active: Projection/ViewInverse/ModelView pipeline reconstruction enabled.");
             }
         }
 
@@ -3272,12 +3443,26 @@ public:
             }
         };
 
-        if (profileActive && !profileMatchedKnownConstants && !profileHardFailure) {
+        if (profileIsBarnyardRequested && !barnyardShaderMatch && g_barnyardShaderHash != 0) {
             snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                     "MGR profile active but this upload did not hit c4-c7/c12-c15/c16-c19; structural fallback used.");
+                     "Barnyard profile waiting for shader hash 0x%08X (current shader not matched).",
+                     g_barnyardShaderHash);
         }
 
-        const bool allowStructuralDetection = !profileActive || profileHardFailure || !profileMatchedKnownConstants;
+        if (profileActive && !profileMatchedKnownConstants && !profileHardFailure) {
+            if (profileIsBarnyard) {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "Barnyard profile active but upload did not hit configured transform registers.");
+            } else {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "MGR profile active but this upload did not hit c4-c7/c12-c15/c16-c19; structural fallback used.");
+            }
+        }
+
+        g_profileDisableStructuralDetection = profileIsBarnyard && !profileHardFailure;
+        const bool allowStructuralDetection = !profileActive || profileHardFailure ||
+                                              (!profileMatchedKnownConstants && !g_profileDisableStructuralDetection);
+
         bool anyStructuralMatch = false;
         if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 3) {
             for (UINT rows : {4u, 3u}) {
@@ -3806,10 +3991,32 @@ void LoadConfig() {
                              static_cast<DWORD>(sizeof(g_config.gameProfile)), path);
     g_activeGameProfile = ParseGameProfile(g_config.gameProfile);
     ConfigureActiveProfileLayout();
+    g_barnyardShaderHash = 0;
+    if (g_activeGameProfile == GameProfile_Barnyard2006) {
+        g_profileLayout.projectionBase = GetPrivateProfileIntA("CameraProxy", "BarnyardProjectionBase", g_profileLayout.projectionBase, path);
+        g_profileLayout.viewInverseBase = GetPrivateProfileIntA("CameraProxy", "BarnyardViewWorldBase", g_profileLayout.viewInverseBase, path);
+        g_profileLayout.modelViewBase = GetPrivateProfileIntA("CameraProxy", "BarnyardModelViewBase", g_profileLayout.modelViewBase, path);
+        g_profileLayout.modelViewCount = GetPrivateProfileIntA("CameraProxy", "BarnyardModelViewCount", g_profileLayout.modelViewCount, path);
+        if (g_profileLayout.modelViewCount < 1) g_profileLayout.modelViewCount = 1;
+        char hashText[32] = {};
+        GetPrivateProfileStringA("CameraProxy", "BarnyardShaderHash", "", hashText, sizeof(hashText), path);
+        if (hashText[0] != '\0') {
+            unsigned int parsed = 0;
+            if (sscanf(hashText, "%x", &parsed) == 1) {
+                g_barnyardShaderHash = static_cast<uint32_t>(parsed);
+            }
+        }
+    }
     g_profileCoreRegistersSeen[0] = g_profileCoreRegistersSeen[1] = g_profileCoreRegistersSeen[2] = false;
     g_profileOptionalRegistersSeen[0] = g_profileOptionalRegistersSeen[1] = false;
     g_profileViewDerivedFromInverse = false;
     g_profileStatusMessage[0] = '\0';
+    g_profileHasViewInverseMatrix = false;
+    g_profileHasDerivedWorldMatrix = false;
+    g_profileHasLastModelViewMatrix = false;
+    g_profileViewInverseConsistencyOk = false;
+    g_profileViewInverseConsistencyError = std::numeric_limits<float>::max();
+    g_profileDisableStructuralDetection = false;
     if (g_config.gameProfile[0] != '\0' && g_activeGameProfile == GameProfile_None) {
         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
                  "Unknown GameProfile='%s'. Falling back to structural detection.", g_config.gameProfile);
@@ -3875,6 +4082,19 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             LogMsg("Remix runtime DLL: %s", g_config.remixDllName);
             LogMsg("Emit fixed-function transforms: %s", g_config.emitFixedFunctionTransforms ? "ENABLED" : "disabled");
             LogMsg("Game profile: %s", GameProfileLabel(g_activeGameProfile));
+            if (g_activeGameProfile == GameProfile_Barnyard2006) {
+                LogMsg("Barnyard layout: proj=c%d-c%d, viewWorld=c%d-c%d, modelViews=c%d..c%d (%d matrices)",
+                       g_profileLayout.projectionBase, g_profileLayout.projectionBase + 3,
+                       g_profileLayout.viewInverseBase, g_profileLayout.viewInverseBase + 3,
+                       g_profileLayout.modelViewBase,
+                       g_profileLayout.modelViewBase + g_profileLayout.modelViewCount * 4 - 1,
+                       g_profileLayout.modelViewCount);
+                LogMsg("Barnyard shader hash gate: %s",
+                       g_barnyardShaderHash ? "ENABLED" : "disabled");
+                if (g_barnyardShaderHash) {
+                    LogMsg("  BarnyardShaderHash=0x%08X", g_barnyardShaderHash);
+                }
+            }
             LogMsg("ImGui scale: %.2fx", g_config.imguiScale);
             LogMsg("Layout strategy mode: %d", g_layoutStrategyMode);
             LogMsg("Probe transposed layouts: %s", g_probeTransposedLayouts ? "ENABLED" : "disabled");
