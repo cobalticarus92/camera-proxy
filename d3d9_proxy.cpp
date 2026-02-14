@@ -59,6 +59,7 @@ struct ProjectionAnalysis {
 
 static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysis* out);
 static const char* ProjectionHandednessLabel(ProjectionHandedness handedness);
+void CreateIdentityMatrix(D3DMATRIX* out);
 class WrappedD3D9Device;
 
 #pragma comment(lib, "user32.lib")
@@ -116,6 +117,8 @@ enum CombinedMVPStrategy {
     CombinedMVPStrategy_SkippedFullWVP,
     CombinedMVPStrategy_Failed
 };
+
+static const char* CombinedMVPStrategyLabel(CombinedMVPStrategy strategy);
 
 struct CombinedMVPDebugState {
     int registerBase = -1;
