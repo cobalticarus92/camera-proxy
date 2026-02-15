@@ -63,12 +63,14 @@ You can enable fixed-profile extraction via `camera_proxy.ini`:
 
 If expected uploads are not matched or inverse-view inversion fails (non-invertible matrix), the proxy logs a warning/status and falls back to structural detection.
 
-**Barnyard profile (world-only forwarding)**
+**Barnyard profile**
 
-- The game still sends `SetTransform(VIEW/PROJECTION)`, but those calls are blocked while the profile is active.
-- The proxy forwards **WORLD only** at draw time.
-- WORLD is detected from vertex shader constant uploads using the same deterministic structural classification used by auto-detect.
-- Optional toggle `BarnyardForceWorldFromC0=1` forces c0-c3 to be treated as WORLD whenever uploaded.
+- The proxy intercepts game `SetTransform(VIEW/PROJECTION)` calls and can round-trip them via `GetTransform()` to capture final 4x4 matrices.
+- Captured VIEW/PROJECTION are cached and re-forwarded at draw time from the proxy path (instead of relying on the game call timing).
+- WORLD is detected from vertex shader constant uploads using deterministic structural classification.
+- Optional toggles:
+  - `BarnyardForceWorldFromC0=1` forces c0-c3 to be treated as WORLD whenever uploaded.
+  - `BarnyardUseGameSetTransformsForViewProjection=1` enables interception/capture of game VIEW/PROJECTION transforms.
 
 ### 6) Draw-time emission
 
