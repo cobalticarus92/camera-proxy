@@ -107,6 +107,9 @@ struct ProxyConfig {
     bool experimentalCustomProjectionOverrideCombinedMVP = false;
     bool mgrrUseAutoProjectionWhenC4Invalid = false;
     bool barnyardUseGameSetTransformsForViewProjection = true;
+    bool disableGameInputWhileMenuOpen = false;
+    bool setTransformBypassProxyWhenGameProvides = false;
+    bool setTransformRoundTripCompatibilityMode = false;
     float experimentalCustomProjectionAutoFovDeg = 60.0f;
     float experimentalCustomProjectionAutoNearZ = 0.1f;
     float experimentalCustomProjectionAutoFarZ = 1000.0f;
@@ -166,6 +169,7 @@ static bool g_barnyardForceWorldFromC0 = false;
 
 static ProxyConfig g_config;
 static HMODULE g_hD3D9 = nullptr;
+static HINSTANCE g_moduleInstance = nullptr;
 static std::once_flag g_initOnce;
 static FILE* g_logFile = nullptr;
 static int g_frameCount = 0;
@@ -244,6 +248,7 @@ static float g_imguiScaleRuntime = 1.0f;
 static ImGuiStyle g_imguiBaseStyle = {};
 static bool g_imguiMgrrUseAutoProjection = false;
 static bool g_imguiBarnyardUseGameSetTransformsForViewProjection = true;
+static bool g_imguiDisableGameInputWhileMenuOpen = false;
 static bool g_imguiBaseStyleCaptured = false;
 static bool g_enableShaderEditing = false;
 static bool g_requestManualEmit = false;
@@ -256,6 +261,12 @@ static int g_projectionDetectedRegister = -1;
 static ProjectionHandedness g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
 static CombinedMVPDebugState g_combinedMvpDebug = {};
 static char g_customProjectionStatus[256] = "";
+static bool g_gameSetTransformSeen[3] = { false, false, false }; // world, view, projection
+static bool g_gameSetTransformAnySeen = false;
+
+static HHOOK g_keyboardBlockHook = nullptr;
+static HHOOK g_mouseBlockHook = nullptr;
+static bool g_imguiAsyncKeyboardPrev[256] = {};
 
 enum HotkeyAction {
     HotkeyAction_ToggleMenu = 0,
@@ -392,6 +403,9 @@ static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPA
             ImGuiIO& io = ImGui::GetIO();
             const bool keyboardMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || msg == WM_CHAR || msg == WM_SYSCHAR;
             const bool mouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
+            if (g_config.disableGameInputWhileMenuOpen && (keyboardMsg || mouseMsg)) {
+                return TRUE;
+            }
             if ((keyboardMsg && io.WantCaptureKeyboard) || (mouseMsg && io.WantCaptureMouse)) {
                 return TRUE;
             }
@@ -401,6 +415,164 @@ static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPA
         return CallWindowProc(g_imguiPrevWndProc, hwnd, msg, wParam, lParam);
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static bool ShouldBypassInputForImGuiMenu() {
+    return g_imguiInitialized && g_showImGui && g_config.disableGameInputWhileMenuOpen;
+}
+
+static bool IsProxyHotkeyVk(DWORD vkCode) {
+    return vkCode == static_cast<DWORD>(g_config.hotkeyToggleMenuVk) ||
+           vkCode == static_cast<DWORD>(g_config.hotkeyTogglePauseVk) ||
+           vkCode == static_cast<DWORD>(g_config.hotkeyEmitMatricesVk) ||
+           vkCode == static_cast<DWORD>(g_config.hotkeyResetMatrixOverridesVk);
+}
+
+static LRESULT CALLBACK LowLevelKeyboardBlockHook(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && ShouldBypassInputForImGuiMenu()) {
+        const KBDLLHOOKSTRUCT* keyInfo = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        if (keyInfo && !IsProxyHotkeyVk(keyInfo->vkCode)) {
+            return 1;
+        }
+    }
+    return CallNextHookEx(g_keyboardBlockHook, nCode, wParam, lParam);
+}
+
+static LRESULT CALLBACK LowLevelMouseBlockHook(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && ShouldBypassInputForImGuiMenu()) {
+        return 1;
+    }
+    return CallNextHookEx(g_mouseBlockHook, nCode, wParam, lParam);
+}
+
+static void UpdateInputBlockHooks() {
+    const bool shouldBlock = ShouldBypassInputForImGuiMenu();
+    if (shouldBlock) {
+        if (!g_keyboardBlockHook) {
+            g_keyboardBlockHook = SetWindowsHookExA(WH_KEYBOARD_LL, LowLevelKeyboardBlockHook, g_moduleInstance, 0);
+        }
+        if (!g_mouseBlockHook) {
+            g_mouseBlockHook = SetWindowsHookExA(WH_MOUSE_LL, LowLevelMouseBlockHook, g_moduleInstance, 0);
+        }
+    } else {
+        if (g_keyboardBlockHook) {
+            UnhookWindowsHookEx(g_keyboardBlockHook);
+            g_keyboardBlockHook = nullptr;
+        }
+        if (g_mouseBlockHook) {
+            UnhookWindowsHookEx(g_mouseBlockHook);
+            g_mouseBlockHook = nullptr;
+        }
+    }
+}
+
+static ImGuiKey VkToImGuiKey(UINT vk) {
+    if (vk >= '0' && vk <= '9') return static_cast<ImGuiKey>(ImGuiKey_0 + (vk - '0'));
+    if (vk >= 'A' && vk <= 'Z') return static_cast<ImGuiKey>(ImGuiKey_A + (vk - 'A'));
+    if (vk >= VK_F1 && vk <= VK_F12) return static_cast<ImGuiKey>(ImGuiKey_F1 + (vk - VK_F1));
+    switch (vk) {
+    case VK_TAB: return ImGuiKey_Tab;
+    case VK_LEFT: return ImGuiKey_LeftArrow;
+    case VK_RIGHT: return ImGuiKey_RightArrow;
+    case VK_UP: return ImGuiKey_UpArrow;
+    case VK_DOWN: return ImGuiKey_DownArrow;
+    case VK_PRIOR: return ImGuiKey_PageUp;
+    case VK_NEXT: return ImGuiKey_PageDown;
+    case VK_HOME: return ImGuiKey_Home;
+    case VK_END: return ImGuiKey_End;
+    case VK_INSERT: return ImGuiKey_Insert;
+    case VK_DELETE: return ImGuiKey_Delete;
+    case VK_BACK: return ImGuiKey_Backspace;
+    case VK_SPACE: return ImGuiKey_Space;
+    case VK_RETURN: return ImGuiKey_Enter;
+    case VK_ESCAPE: return ImGuiKey_Escape;
+    case VK_OEM_7: return ImGuiKey_Apostrophe;
+    case VK_OEM_COMMA: return ImGuiKey_Comma;
+    case VK_OEM_MINUS: return ImGuiKey_Minus;
+    case VK_OEM_PERIOD: return ImGuiKey_Period;
+    case VK_OEM_2: return ImGuiKey_Slash;
+    case VK_OEM_1: return ImGuiKey_Semicolon;
+    case VK_OEM_PLUS: return ImGuiKey_Equal;
+    case VK_OEM_4: return ImGuiKey_LeftBracket;
+    case VK_OEM_5: return ImGuiKey_Backslash;
+    case VK_OEM_6: return ImGuiKey_RightBracket;
+    case VK_OEM_3: return ImGuiKey_GraveAccent;
+    case VK_CAPITAL: return ImGuiKey_CapsLock;
+    case VK_SCROLL: return ImGuiKey_ScrollLock;
+    case VK_NUMLOCK: return ImGuiKey_NumLock;
+    case VK_SNAPSHOT: return ImGuiKey_PrintScreen;
+    case VK_PAUSE: return ImGuiKey_Pause;
+    case VK_NUMPAD0: return ImGuiKey_Keypad0;
+    case VK_NUMPAD1: return ImGuiKey_Keypad1;
+    case VK_NUMPAD2: return ImGuiKey_Keypad2;
+    case VK_NUMPAD3: return ImGuiKey_Keypad3;
+    case VK_NUMPAD4: return ImGuiKey_Keypad4;
+    case VK_NUMPAD5: return ImGuiKey_Keypad5;
+    case VK_NUMPAD6: return ImGuiKey_Keypad6;
+    case VK_NUMPAD7: return ImGuiKey_Keypad7;
+    case VK_NUMPAD8: return ImGuiKey_Keypad8;
+    case VK_NUMPAD9: return ImGuiKey_Keypad9;
+    case VK_DECIMAL: return ImGuiKey_KeypadDecimal;
+    case VK_DIVIDE: return ImGuiKey_KeypadDivide;
+    case VK_MULTIPLY: return ImGuiKey_KeypadMultiply;
+    case VK_SUBTRACT: return ImGuiKey_KeypadSubtract;
+    case VK_ADD: return ImGuiKey_KeypadAdd;
+    case VK_LSHIFT: return ImGuiKey_LeftShift;
+    case VK_RSHIFT: return ImGuiKey_RightShift;
+    case VK_LCONTROL: return ImGuiKey_LeftCtrl;
+    case VK_RCONTROL: return ImGuiKey_RightCtrl;
+    case VK_LMENU: return ImGuiKey_LeftAlt;
+    case VK_RMENU: return ImGuiKey_RightAlt;
+    case VK_LWIN: return ImGuiKey_LeftSuper;
+    case VK_RWIN: return ImGuiKey_RightSuper;
+    case VK_APPS: return ImGuiKey_Menu;
+    default: return ImGuiKey_None;
+    }
+}
+
+static void UpdateImGuiKeyboardFromAsyncState() {
+    if (!g_showImGui || !g_imguiInitialized) {
+        memset(g_imguiAsyncKeyboardPrev, 0, sizeof(g_imguiAsyncKeyboardPrev));
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    for (UINT vk = 0; vk < 256; ++vk) {
+        const bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+        const bool prev = g_imguiAsyncKeyboardPrev[vk];
+        if (down == prev) {
+            continue;
+        }
+        g_imguiAsyncKeyboardPrev[vk] = down;
+        const ImGuiKey key = VkToImGuiKey(vk);
+        if (key != ImGuiKey_None) {
+            io.AddKeyEvent(key, down);
+            io.SetKeyEventNativeData(key, vk, static_cast<int>(MapVirtualKeyA(vk, MAPVK_VK_TO_VSC)));
+        }
+        if (down) {
+            BYTE keyboardState[256] = {};
+            if (GetKeyboardState(keyboardState)) {
+                WCHAR utf16Buf[4] = {};
+                const int translated = ToUnicode(vk,
+                                                 MapVirtualKeyA(vk, MAPVK_VK_TO_VSC),
+                                                 keyboardState,
+                                                 utf16Buf,
+                                                 4,
+                                                 0);
+                if (translated > 0) {
+                    for (int i = 0; i < translated; ++i) {
+                        io.AddInputCharacterUTF16(utf16Buf[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    io.AddKeyEvent(ImGuiMod_Ctrl, (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
+    io.AddKeyEvent(ImGuiMod_Shift, (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
+    io.AddKeyEvent(ImGuiMod_Alt, (GetAsyncKeyState(VK_MENU) & 0x8000) != 0);
+    io.AddKeyEvent(ImGuiMod_Super, (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+                                  (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
 }
 
 static void EnsureWndProcHookInstalled() {
@@ -662,7 +834,9 @@ static void ShutdownImGui() {
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
+    g_showImGui = false;
     g_imguiInitialized = false;
+    UpdateInputBlockHooks();
     g_imguiPrevWndProc = nullptr;
     g_imguiHwnd = nullptr;
     g_prevShowImGui = false;
@@ -1695,6 +1869,7 @@ static void UpdateHotkeys() {
         ReleaseCapture();
     }
     g_prevShowImGui = g_showImGui;
+    UpdateInputBlockHooks();
 }
 
 static void UpdateFrameTimeStats() {
@@ -1748,6 +1923,7 @@ static void RenderImGuiOverlay() {
     ApplyImGuiScale(g_imguiHwnd);
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    UpdateImGuiKeyboardFromAsyncState();
     if (g_showImGui) {
         POINT cursorScreen = {};
         if (GetCursorPos(&cursorScreen) && ScreenToClient(g_imguiHwnd, &cursorScreen)) {
@@ -1792,6 +1968,12 @@ static void RenderImGuiOverlay() {
     if (ImGui::SliderFloat("UI scale", &g_imguiScaleRuntime, 0.5f, 3.0f, "%.2fx")) {
         ApplyImGuiScale(g_imguiHwnd);
         g_config.imguiScale = g_imguiScaleRuntime;
+    }
+
+    if (ImGui::Checkbox("Disable game input while menu is open", &g_imguiDisableGameInputWhileMenuOpen)) {
+        g_config.disableGameInputWhileMenuOpen = g_imguiDisableGameInputWhileMenuOpen;
+        SaveConfigBoolValue("DisableGameInputWhileMenuOpen", g_config.disableGameInputWhileMenuOpen);
+        UpdateInputBlockHooks();
     }
 
     if (ImGui::Button("Pass camera matrices to RTX Remix (SetTransform)")) {
@@ -1843,6 +2025,22 @@ static void RenderImGuiOverlay() {
     if (ImGui::BeginTabBar("MainTabs")) {
         if (ImGui::BeginTabItem("Camera")) {
             ImGui::Text("Active game profile: %s", GameProfileLabel(g_activeGameProfile));
+            ImGui::Text("Game SetTransform seen: WORLD=%s VIEW=%s PROJECTION=%s",
+                        g_gameSetTransformSeen[0] ? "yes" : "no",
+                        g_gameSetTransformSeen[1] ? "yes" : "no",
+                        g_gameSetTransformSeen[2] ? "yes" : "no");
+            if (g_gameSetTransformAnySeen) {
+                if (ImGui::Checkbox("Bypass proxy WVP emit when game provides SetTransform", &g_config.setTransformBypassProxyWhenGameProvides)) {
+                    SaveConfigBoolValue("SetTransformBypassProxyWhenGameProvides",
+                                        g_config.setTransformBypassProxyWhenGameProvides);
+                }
+                if (ImGui::Checkbox("Round-trip game SetTransform via GetTransform for strict compatibility", &g_config.setTransformRoundTripCompatibilityMode)) {
+                    SaveConfigBoolValue("SetTransformRoundTripCompatibilityMode",
+                                        g_config.setTransformRoundTripCompatibilityMode);
+                }
+            } else {
+                ImGui::TextDisabled("SetTransform compatibility options unlock once game calls SetTransform(WORLD/VIEW/PROJECTION).");
+            }
             if (g_activeGameProfile == GameProfile_MetalGearRising) {
                 ImGui::Text("MGR layout: Proj=c4-c7, ViewProjection=c8-c11, World=c16-c19");
                 ImGui::Checkbox("Use auto projection when c4 is invalid", &g_imguiMgrrUseAutoProjection);
@@ -3398,6 +3596,9 @@ public:
         if (!g_config.emitFixedFunctionTransforms) {
             return;
         }
+        if (g_config.setTransformBypassProxyWhenGameProvides && g_gameSetTransformAnySeen) {
+            return;
+        }
         if (g_activeGameProfile == GameProfile_MetalGearRising) {
             // MGR profile is strict: only emit transforms when all three known registers
             // have been captured. Never emit identity/fallback transforms in this mode.
@@ -4392,6 +4593,69 @@ public:
     HRESULT STDMETHODCALLTYPE EndScene() override { return m_real->EndScene(); }
     HRESULT STDMETHODCALLTYPE Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) override { return m_real->Clear(Count, pRects, Flags, Color, Z, Stencil); }
     HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override {
+        int transformIdx = -1;
+        if (State == D3DTS_WORLD) transformIdx = 0;
+        if (State == D3DTS_VIEW) transformIdx = 1;
+        if (State == D3DTS_PROJECTION) transformIdx = 2;
+        if (transformIdx >= 0 && pMatrix) {
+            g_gameSetTransformSeen[transformIdx] = true;
+            g_gameSetTransformAnySeen = true;
+
+            if (g_config.setTransformBypassProxyWhenGameProvides) {
+                if (State == D3DTS_WORLD) {
+                    m_currentWorld = *pMatrix;
+                    m_hasWorld = true;
+                    m_worldLastFrame = g_frameCount;
+                    StoreWorldMatrix(m_currentWorld, 0, -1, 4, false, true,
+                                     "game SetTransform(World) direct passthrough");
+                } else if (State == D3DTS_VIEW) {
+                    m_currentView = *pMatrix;
+                    m_hasView = true;
+                    m_viewLastFrame = g_frameCount;
+                    StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
+                                    "game SetTransform(View) direct passthrough");
+                } else if (State == D3DTS_PROJECTION) {
+                    m_currentProj = *pMatrix;
+                    m_hasProj = true;
+                    m_projLastFrame = g_frameCount;
+                    StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
+                                          "game SetTransform(Projection) direct passthrough");
+                }
+                return m_real->SetTransform(State, pMatrix);
+            }
+
+            if (g_config.setTransformRoundTripCompatibilityMode) {
+                const HRESULT setHr = m_real->SetTransform(State, pMatrix);
+                if (FAILED(setHr)) {
+                    return setHr;
+                }
+                D3DMATRIX roundTrip = *pMatrix;
+                if (SUCCEEDED(m_real->GetTransform(State, &roundTrip))) {
+                    m_real->SetTransform(State, &roundTrip);
+                }
+                if (State == D3DTS_WORLD) {
+                    m_currentWorld = roundTrip;
+                    m_hasWorld = true;
+                    m_worldLastFrame = g_frameCount;
+                    StoreWorldMatrix(m_currentWorld, 0, -1, 4, false, true,
+                                     "game SetTransform(World)+GetTransform compatibility");
+                } else if (State == D3DTS_VIEW) {
+                    m_currentView = roundTrip;
+                    m_hasView = true;
+                    m_viewLastFrame = g_frameCount;
+                    StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
+                                    "game SetTransform(View)+GetTransform compatibility");
+                } else if (State == D3DTS_PROJECTION) {
+                    m_currentProj = roundTrip;
+                    m_hasProj = true;
+                    m_projLastFrame = g_frameCount;
+                    StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
+                                          "game SetTransform(Projection)+GetTransform compatibility");
+                }
+                return setHr;
+            }
+        }
+
         if (g_activeGameProfile == GameProfile_Barnyard &&
             (State == D3DTS_VIEW || State == D3DTS_PROJECTION)) {
             if (!g_config.barnyardUseGameSetTransformsForViewProjection || !pMatrix) {
@@ -4850,7 +5114,14 @@ void LoadConfig() {
     g_barnyardForceWorldFromC0 = GetPrivateProfileIntA("CameraProxy", "BarnyardForceWorldFromC0", 0, path) != 0;
     g_config.barnyardUseGameSetTransformsForViewProjection =
         GetPrivateProfileIntA("CameraProxy", "BarnyardUseGameSetTransformsForViewProjection", 1, path) != 0;
+    g_config.disableGameInputWhileMenuOpen =
+        GetPrivateProfileIntA("CameraProxy", "DisableGameInputWhileMenuOpen", 0, path) != 0;
+    g_config.setTransformBypassProxyWhenGameProvides =
+        GetPrivateProfileIntA("CameraProxy", "SetTransformBypassProxyWhenGameProvides", 0, path) != 0;
+    g_config.setTransformRoundTripCompatibilityMode =
+        GetPrivateProfileIntA("CameraProxy", "SetTransformRoundTripCompatibilityMode", 0, path) != 0;
     g_imguiBarnyardUseGameSetTransformsForViewProjection = g_config.barnyardUseGameSetTransformsForViewProjection;
+    g_imguiDisableGameInputWhileMenuOpen = g_config.disableGameInputWhileMenuOpen;
     if (g_config.gameProfile[0] != '\0' && g_activeGameProfile == GameProfile_None) {
         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
                  "Unknown GameProfile='%s'. Falling back to structural detection.", g_config.gameProfile);
@@ -4954,8 +5225,10 @@ static void EnsureProxyInitialized() {
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
+        g_moduleInstance = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
+        g_moduleInstance = nullptr;
         if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
         if (g_hD3D9) { FreeLibrary(g_hD3D9); g_hD3D9 = nullptr; }
     }
