@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <unordered_map>
 
-#include "remix/remix_c.h"
+#include "remixapi/bridge_remix_api.h"
 
 using RemixLightHandle = uint64_t;
 
