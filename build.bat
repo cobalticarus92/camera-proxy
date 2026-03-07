@@ -23,8 +23,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-set "SOURCES=d3d9_proxy.cpp remix_lighting_manager.cpp lights_tab_ui.cpp custom_lights.cpp custom_lights_ui.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_dx9.cpp imgui/backends/imgui_impl_win32.cpp"
-set "COMMON_FLAGS=/nologo /LD /EHsc /O2 /MD"
+set "SOURCES=src/core/d3d9_proxy.cpp src/core/remix_lighting_manager.cpp src/ui/lights_tab_ui.cpp src/lights/custom_lights.cpp src/ui/custom_lights_ui.cpp third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp third_party/imgui/backends/imgui_impl_dx9.cpp third_party/imgui/backends/imgui_impl_win32.cpp"
+set "COMMON_FLAGS=/nologo /LD /EHsc /O2 /MD /I. /Isrc/core /Isrc/ui /Isrc/lights /Ithird_party /Ithird_party/imgui /Ithird_party/imgui/backends"
 set "LINK_FLAGS=/link /DEF:d3d9.def"
 
 if /I "%TARGET%"=="x86" (
